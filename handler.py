@@ -343,7 +343,9 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
 # ═════════════════════════════════════════════════════════════════════════════
 # INPAINTING + FINISARE
 # ═════════════════════════════════════════════════════════════════════════════
-def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size):
+def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, quality="fast"):
+    """quality="fast" → doar ProPainter (~2 min pt 20s video, foarte bun pe captions).
+    quality="max"  → + rafinare DiffuEraser (calitate maximă, dar de 3-5x mai lent)."""
     priori_path = os.path.join(workdir, "priori.mp4")
     result_path = os.path.join(workdir, "diffueraser_out.mp4")
     video_length = int(duration_s) + 1
@@ -355,6 +357,12 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size):
         ref_stride=10, neighbor_length=10, subvideo_length=50,
         mask_dilation=8,
     )
+    if quality != "max":
+        print("[INPAINT] quality=fast → sar peste DiffuEraser", flush=True)
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+        return priori_path
+
     print("[INPAINT] DiffuEraser refine...", flush=True)
     DIFFU.forward(
         video_path, mask_path, priori_path, result_path,
@@ -471,11 +479,12 @@ def handler(job):
         extra_prompts = job_input.get("extra_prompts") or []
         max_img_size = int(job_input.get("max_img_size") or 960)
         max_img_size = max(512, min(1920, max_img_size))
+        quality = str(job_input.get("quality") or "fast").lower()
 
         video_path = fetch_video(job_input, workdir)
         video_path = normalize_fps(video_path, workdir)
         w, h, fps, n_frames, duration = probe(video_path)
-        print(f"[JOB] {w}x{h} @ {fps:.2f}fps, {n_frames} frames, {duration:.1f}s, targets={targets}", flush=True)
+        print(f"[JOB] {w}x{h} @ {fps:.2f}fps, {n_frames} frames, {duration:.1f}s, targets={targets}, quality={quality}", flush=True)
 
         if duration > MAX_SECONDS:
             return {"error": f"Video prea lung ({duration:.0f}s). Maxim: {MAX_SECONDS:.0f}s."}
@@ -493,7 +502,7 @@ def handler(job):
         build_mask_video(mask_path, w, h, fps, n_frames,
                          static_boxes, dynamic_by_kf, kf_indices, workdir)
 
-        result_path = run_inpainting(video_path, mask_path, workdir, duration, max_img_size)
+        result_path = run_inpainting(video_path, mask_path, workdir, duration, max_img_size, quality)
 
         out_path = os.path.join(workdir, "final.mp4")
         finalize(result_path, video_path, out_path, w, h)
