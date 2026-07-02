@@ -2,7 +2,7 @@
 
 <!-- build: v1.1 — fix PCM LoRA path (symlink weights/ -> WEIGHTS_DIR) -->
 
-Worker RunPod Serverless: șterge **automat** captions, logo-uri și watermark-uri din video.
+Worker RunPod Serverless: ștderge **automat** captions, logo-uri și watermark-uri din video.
 Detecție: EasyOCR (text, pe keyframes) + Florence-2 (logo/watermark, open-vocabulary).
 Inpainting: ProPainter (priori) + DiffuEraser (rafinare diffusion, consistent temporal).
 
