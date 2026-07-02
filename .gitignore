@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+weights/
+*.mp4
+.env

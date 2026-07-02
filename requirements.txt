@@ -1,0 +1,18 @@
+# AUTO Eraser — RunPod worker
+# NOTĂ: DiffuEraser își instalează propriile dependințe din repo (requirements.txt-ul lui).
+# Aici sunt doar cele suplimentare pentru handler + detecție.
+
+runpod>=1.6.0
+requests
+numpy
+opencv-python-headless
+Pillow
+huggingface_hub
+
+# Detecție
+easyocr>=1.7.1
+timm            # necesar pentru Florence-2
+einops
+
+# transformers/diffusers/accelerate vin din requirements-ul DiffuEraser (vezi Dockerfile);
+# dacă apar conflicte, pin-uiește: transformers==4.46.3
