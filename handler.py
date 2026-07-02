@@ -71,6 +71,17 @@ if not os.path.exists(os.path.join(WEIGHTS_DIR, ".easyocr.done")):
         check=True,
     )
 
+# DiffuEraser are hardcodată calea RELATIVĂ "weights/PCM_Weights" pentru LoRA-ul
+# PCM (diffueraser.py, load_lora_weights). Cu greutățile pe Network Volume,
+# ./weights nu există în CWD → symlink către WEIGHTS_DIR ca să se rezolve.
+_local_weights = os.path.join(os.getcwd(), "weights")
+if os.path.realpath(_local_weights) != os.path.realpath(WEIGHTS_DIR):
+    if os.path.islink(_local_weights):
+        os.unlink(_local_weights)
+    if not os.path.exists(_local_weights):
+        os.symlink(WEIGHTS_DIR, _local_weights)
+        print(f"[INIT] Symlink {_local_weights} → {WEIGHTS_DIR}", flush=True)
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE  = torch.float16 if DEVICE == "cuda" else torch.float32
 
