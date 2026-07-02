@@ -403,6 +403,32 @@ def fetch_video(job_input, workdir):
     return video_path
 
 
+def normalize_fps(video_path, workdir):
+    """DiffuEraser cere fps IDENTIC între video, mască și priori (read_priori
+    compară strict și aruncă "The frame rate of all input videos needs to be
+    consistent."). FPS-urile fracționare din filmări de telefon (ex. 30.05,
+    29.97) se cuantizează diferit prin lanțul cv2/ffmpeg/imageio → re-eșantionăm
+    inputul la fps ÎNTREG constant (CFR), o singură dată, la intrare."""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+    target = max(10, min(60, int(round(fps)) or 30))
+    if abs(fps - target) < 0.01:
+        return video_path
+    norm_path = os.path.join(workdir, "input_cfr.mp4")
+    print(f"[NORM] {fps:.3f}fps → {target}fps CFR", flush=True)
+    subprocess.run([
+        "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+        "-i", video_path,
+        "-vf", f"fps={target}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        norm_path,
+    ], check=True)
+    return norm_path
+
+
 def probe(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -447,6 +473,7 @@ def handler(job):
         max_img_size = max(512, min(1920, max_img_size))
 
         video_path = fetch_video(job_input, workdir)
+        video_path = normalize_fps(video_path, workdir)
         w, h, fps, n_frames, duration = probe(video_path)
         print(f"[JOB] {w}x{h} @ {fps:.2f}fps, {n_frames} frames, {duration:.1f}s, targets={targets}", flush=True)
 
