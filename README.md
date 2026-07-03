@@ -1,6 +1,6 @@
 # auto-eraser-worker
 
-<!-- build: v1.1 — fix PCM LoRA path (symlink weights/ -> WEIGHTS_DIR) -->
+<!-- build: v2.0 — greutăți baked în imagine + torch 2.7/cu128 (Blackwell) -->
 
 Worker RunPod Serverless: ștderge **automat** captions, logo-uri și watermark-uri din video.
 Detecție: EasyOCR (text, pe keyframes) + Florence-2 (logo/watermark, open-vocabulary).
@@ -16,10 +16,11 @@ per aplicație.
 2. **Serverless → New Endpoint → GitHub Repo** → alege repo-ul, branch `main`,
    Dockerfile în root.
 3. Config endpoint:
-   - GPU: 24 GB (L4 / RTX 4090 / A5000); pt 1080p full: L40S 48GB
-   - Container Disk: 30 GB
-   - Network Volume: 40 GB, montat (aici se descarcă automat ~15GB de greutăți la primul start)
-   - Env: `WEIGHTS_DIR=/runpod-volume/weights`
+   - GPU: 24 GB (RTX 4090 / 5090 / L4 / A5000); pt 1080p full: L40S 48GB.
+     torch 2.7 + cu128 → merge inclusiv pe Blackwell/RTX 50xx.
+   - Container Disk: 60 GB (imaginea are ~35GB — greutățile sunt BAKED în ea)
+   - Network Volume: NU mai e nevoie (greutățile vin în imagine; dacă volumul
+     și `WEIGHTS_DIR` rămân setate, handler-ul le ignoră — poți să le scoți)
    - Idle Timeout: 120s · Execution Timeout: 1800s
 
 ## API

@@ -1,51 +1,53 @@
 # Dockerfile — AUTO Eraser (RunPod Serverless)
 # Detecție automată (EasyOCR + Florence-2) + Inpainting (ProPainter + DiffuEraser)
 #
-# Build & push:
-#   docker build -t <dockerhub_user>/auto-eraser:latest .
-#   docker push <dockerhub_user>/auto-eraser:latest
+# Imaginea conține TOT: cod + greutăți (~15GB, descărcate la BUILD) → zero
+# download la cold start, pe orice mașină. Nu mai e nevoie de Network Volume;
+# dacă endpointul mai are WEIGHTS_DIR setat pe volum, handler-ul îl ignoră
+# când găsește greutățile complete în imagine.
 #
-# RunPod: New Endpoint → Container Image → <dockerhub_user>/auto-eraser:latest
-#   GPU recomandat: 24GB+ (L4 / RTX 4090 / A5000). Pentru 1080p full: L40S 48GB.
-#   Container Disk: minim 60 GB (greutățile au ~15 GB + imagine + temp)
+# PyTorch 2.7 + CUDA 12.8 → kernele pentru toate GPU-urile, inclusiv
+# Blackwell/RTX 50xx (sm_120) — fix pentru "no kernel image is available".
 #
-# ⚠️ Imaginea finală e MARE (~30-40GB) pentru că greutățile sunt copiate în ea
-#    → cold start-ul e mai lent la primul run pe un host nou, apoi e cache-uit.
-#    Alternativă: Network Volume — setează WEIGHTS_DIR=/runpod-volume/weights
-#    și rulează download_weights.py o singură dată pe volum (vezi README).
+# GPU recomandat: 24GB+ (RTX 4090 / 5090 / L4 / A5000; pt 1080p full: L40S).
+# Container Disk: minim 60 GB (imagine ~35GB + temp la procesare).
 
-FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
+ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
-# Dependințe sistem: FFmpeg + OpenCV runtime + git
+# Sistem: Python 3.10 + FFmpeg + OpenCV runtime + git
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ffmpeg \
-        git \
-        libgl1-mesa-glx \
-        libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+        python3 python3-dev python3-pip git ffmpeg \
+        libgl1-mesa-glx libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/bin/python3 /usr/local/bin/python && \
+    python -m pip install --no-cache-dir --upgrade pip
 
-# 1. DiffuEraser (cod + dependințele lui)
+# PyTorch 2.7 cu CUDA 12.8 (suport nativ Blackwell sm_120)
+RUN pip install --no-cache-dir \
+    torch==2.7.0 torchvision==0.22.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# 1. DiffuEraser (cod + dependințele lui) — FĂRĂ torch-ul pinuit de el
+#    (torch==2.3.1/torchvision/torchaudio ne-ar downgrade-ui build-ul cu128)
 RUN git clone --depth 1 https://github.com/lixiaowen-xw/DiffuEraser.git /app/DiffuEraser && \
+    sed -i '/^torch/d' /app/DiffuEraser/requirements.txt && \
     pip install --no-cache-dir -r /app/DiffuEraser/requirements.txt
 
 # 2. Dependințele handler-ului (detecție + runpod)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 3. Greutățile — DOUĂ variante:
-#    A) RECOMANDAT — Network Volume: imagine slim, push rapid de acasă.
-#       NU face nimic aici. Pe endpoint setezi WEIGHTS_DIR=/runpod-volume/weights
-#       și atașezi un Network Volume; handler.py descarcă automat greutățile
-#       pe volum la primul start (o singură dată, ~15GB pe netul RunPod).
-#    B) Baked în imagine: decomentează RUN-ul de mai jos → cold start mai rapid,
-#       dar imaginea crește la ~35GB și push-ul de acasă durează ore.
+# 3. Greutățile — BAKED în imagine la build: SD1.5 + VAE + DiffuEraser + PCM
+#    + ProPainter + Florence-2 + EasyOCR (~15GB). Build-ul durează mai mult,
+#    dar workerii pornesc fără niciun download, exact ca la captionremover.
 ENV WEIGHTS_DIR=/app/weights
 ENV DIFFUERASER_DIR=/app/DiffuEraser
 COPY download_weights.py .
-# RUN python download_weights.py   # ← varianta B (bake în imagine)
+RUN python download_weights.py
 
 # 4. Handler
 COPY handler.py .

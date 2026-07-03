@@ -47,6 +47,15 @@ from PIL import Image
 # ── Config din env ───────────────────────────────────────────────────────────
 WEIGHTS_DIR      = os.environ.get("WEIGHTS_DIR", "/app/weights")
 DIFFUERASER_DIR  = os.environ.get("DIFFUERASER_DIR", "/app/DiffuEraser")
+
+# Greutățile BAKED în imagine au prioritate: dacă build-ul le conține deja
+# complete (markerul .easyocr.done e ultimul scris de download_weights.py),
+# ignorăm WEIGHTS_DIR extern (ex. Network Volume rămas setat pe endpoint)
+# → zero download la cold start, indiferent de mașină/volum.
+_BAKED_WEIGHTS = "/app/weights"
+if WEIGHTS_DIR != _BAKED_WEIGHTS and os.path.exists(os.path.join(_BAKED_WEIGHTS, ".easyocr.done")):
+    print(f"[INIT] Greutăți baked în imagine → folosesc {_BAKED_WEIGHTS} (ignor WEIGHTS_DIR={WEIGHTS_DIR})", flush=True)
+    WEIGHTS_DIR = _BAKED_WEIGHTS
 MAX_SECONDS      = float(os.environ.get("MAX_SECONDS", "90"))
 DETECT_INTERVAL  = float(os.environ.get("DETECT_INTERVAL", "0.5"))   # secunde între keyframes OCR
 FLORENCE_INTERVAL = float(os.environ.get("FLORENCE_INTERVAL", "2.0")) # secunde între keyframes Florence
