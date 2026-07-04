@@ -37,6 +37,8 @@ import tempfile
 import subprocess
 import traceback
 
+import gc
+
 import runpod
 import requests
 import numpy as np
@@ -57,6 +59,9 @@ if WEIGHTS_DIR != _BAKED_WEIGHTS and os.path.exists(os.path.join(_BAKED_WEIGHTS,
     print(f"[INIT] Greutăți baked în imagine → folosesc {_BAKED_WEIGHTS} (ignor WEIGHTS_DIR={WEIGHTS_DIR})", flush=True)
     WEIGHTS_DIR = _BAKED_WEIGHTS
 MAX_SECONDS      = float(os.environ.get("MAX_SECONDS", "90"))
+MAX_FPS          = int(os.environ.get("MAX_FPS", "30"))              # 60fps → 30fps: jumătate din cadre = jumătate din VRAM/timp
+PROC_MAX_SIDE    = int(os.environ.get("PROC_MAX_SIDE", "640"))       # latura lungă la care rulează inpainting-ul
+PROC_FRAME_BUDGET = int(os.environ.get("PROC_FRAME_BUDGET", "1200")) # peste atât, rezoluția scade proporțional (VRAM ~ cadre × pixeli)
 DETECT_INTERVAL  = float(os.environ.get("DETECT_INTERVAL", "0.5"))   # secunde între keyframes OCR
 FLORENCE_INTERVAL = float(os.environ.get("FLORENCE_INTERVAL", "2.0")) # secunde între keyframes Florence
 OCR_CONF         = float(os.environ.get("OCR_CONF", "0.25"))
@@ -334,7 +339,8 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
             mask[y1:y2, x1:x2] = 255
         if mask.any():
             total_active += 1
-        cv2.imwrite(os.path.join(png_dir, f"{fidx:06d}.png"), mask)
+        cv2.imwrite(os.path.join(png_dir, f"{fidx:06d}.png"), mask,
+                    [cv2.IMWRITE_PNG_COMPRESSION, 1])
 
     subprocess.run([
         "ffmpeg", "-y", "-nostats", "-loglevel", "error",
@@ -352,20 +358,51 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
 # ═════════════════════════════════════════════════════════════════════════════
 # INPAINTING + FINISARE
 # ═════════════════════════════════════════════════════════════════════════════
-def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, quality="fast"):
+def _proc_size(w, h, n_frames):
+    """Rezoluția la care rulează ProPainter. VRAM-ul lui crește liniar cu
+    cadre × pixeli (ține TOT videoul + flow-urile pe GPU) → țintim latura lungă
+    PROC_MAX_SIDE, iar peste PROC_FRAME_BUDGET cadre reducem suplimentar cu
+    sqrt(budget/cadre) ca produsul cadre×pixeli să rămână constant."""
+    ratio = min(1.0, PROC_MAX_SIDE / float(max(w, h)))
+    if n_frames > PROC_FRAME_BUDGET:
+        ratio *= (PROC_FRAME_BUDGET / float(n_frames)) ** 0.5
+    pw = max(64, int(w * ratio)) // 2 * 2
+    ph = max(64, int(h * ratio)) // 2 * 2
+    return pw, ph
+
+
+def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, quality, w, h, n_frames):
     """quality="fast" → doar ProPainter (~2 min pt 20s video, foarte bun pe captions).
-    quality="max"  → + rafinare DiffuEraser (calitate maximă, dar de 3-5x mai lent)."""
+    quality="max"  → + rafinare DiffuEraser (calitate maximă, dar de 3-5x mai lent).
+    Inpainting-ul rulează la rezoluție redusă (_proc_size); finalize() pune
+    rezultatul înapoi peste originalul full-res doar în zonele mascate."""
     priori_path = os.path.join(workdir, "priori.mp4")
     result_path = os.path.join(workdir, "diffueraser_out.mp4")
     video_length = int(duration_s) + 1
 
-    print("[INPAINT] ProPainter priori...", flush=True)
-    PROPAINTER.forward(
-        video_path, mask_path, priori_path,
-        video_length=video_length,
-        ref_stride=10, neighbor_length=10, subvideo_length=50,
-        mask_dilation=8,
-    )
+    pw, ph = _proc_size(w, h, n_frames)
+    print(f"[INPAINT] ProPainter priori @ {pw}x{ph} ({n_frames} cadre)...", flush=True)
+    try:
+        # resize_ratio=1.0 + width/height explicite → dezactivăm downscale-ul
+        # intern nedeterminist al DiffuEraser (default 0.6, ×0.5 peste 960px)
+        PROPAINTER.forward(
+            video_path, mask_path, priori_path,
+            resize_ratio=1.0, width=pw, height=ph,
+            video_length=video_length,
+            ref_stride=10, neighbor_length=10, subvideo_length=50,
+            mask_dilation=8,
+        )
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache(); gc.collect()
+        pw, ph = max(64, int(pw * 0.6)) // 2 * 2, max(64, int(ph * 0.6)) // 2 * 2
+        print(f"[INPAINT] CUDA OOM → reîncerc la {pw}x{ph}", flush=True)
+        PROPAINTER.forward(
+            video_path, mask_path, priori_path,
+            resize_ratio=1.0, width=pw, height=ph,
+            video_length=video_length,
+            ref_stride=10, neighbor_length=10, subvideo_length=50,
+            mask_dilation=8,
+        )
     if quality != "max":
         print("[INPAINT] quality=fast → sar peste DiffuEraser", flush=True)
         if DEVICE == "cuda":
@@ -385,14 +422,24 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, qua
     return result_path
 
 
-def finalize(result_path, original_path, out_path, w, h):
-    """Scale înapoi la rezoluția originală + remux audio original."""
+def finalize(result_path, original_path, mask_path, out_path, w, h):
+    """Compune rezultatul inpaint (procesat la rezoluție redusă) înapoi peste
+    originalul full-res DOAR în zonele mascate + remux audio original.
+    Înainte, TOT videoul era upscalat din rezoluția de procesare (~576p) —
+    acum doar pixelii de sub mască vin din inpaint, restul rămân 1:1 originali.
+    Masca e binarizată explicit (lut) fiindcă mp4-ul ei e limited-range
+    (alb = Y 235, nu 255 → ar lăsa 8% din textul original să transpară)."""
     subprocess.run([
         "ffmpeg", "-y", "-nostats", "-loglevel", "error",
-        "-i", result_path,
         "-i", original_path,
-        "-map", "0:v:0", "-map", "1:a:0?",
-        "-vf", f"scale={w}:{h}:flags=lanczos",
+        "-i", result_path,
+        "-i", mask_path,
+        "-filter_complex",
+        f"[1:v]scale={w}:{h}:flags=lanczos,setsar=1,format=yuva420p[res];"
+        f"[2:v]scale={w}:{h},format=gray,lut=c0='if(gt(val,40),255,0)',gblur=sigma=2[m];"
+        f"[res][m]alphamerge[ov];"
+        f"[0:v][ov]overlay=shortest=1,format=yuv420p[out]",
+        "-map", "[out]", "-map", "0:a:0?",
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
@@ -425,11 +472,13 @@ def normalize_fps(video_path, workdir):
     compară strict și aruncă "The frame rate of all input videos needs to be
     consistent."). FPS-urile fracționare din filmări de telefon (ex. 30.05,
     29.97) se cuantizează diferit prin lanțul cv2/ffmpeg/imageio → re-eșantionăm
-    inputul la fps ÎNTREG constant (CFR), o singură dată, la intrare."""
+    inputul la fps ÎNTREG constant (CFR), o singură dată, la intrare.
+    Plafonăm la MAX_FPS (default 30): la 60fps un clip de 27s = 1600+ cadre →
+    ProPainter le ține pe toate în VRAM și dă CUDA OOM pe 24GB."""
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
-    target = max(10, min(60, int(round(fps)) or 30))
+    target = max(10, min(MAX_FPS, int(round(fps)) or 30))
     if abs(fps - target) < 0.01:
         return video_path
     norm_path = os.path.join(workdir, "input_cfr.mp4")
@@ -507,14 +556,20 @@ def handler(job):
             print("[JOB] Nimic detectat — returnez fără procesare", flush=True)
             return {"nothing_detected": True}
 
+        # eliberăm VRAM-ul rămas de la detecție (Florence/EasyOCR) înainte de inpainting
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
         mask_path = os.path.join(workdir, "mask.mp4")
         build_mask_video(mask_path, w, h, fps, n_frames,
                          static_boxes, dynamic_by_kf, kf_indices, workdir)
 
-        result_path = run_inpainting(video_path, mask_path, workdir, duration, max_img_size, quality)
+        result_path = run_inpainting(video_path, mask_path, workdir, duration,
+                                     max_img_size, quality, w, h, n_frames)
 
         out_path = os.path.join(workdir, "final.mp4")
-        finalize(result_path, video_path, out_path, w, h)
+        finalize(result_path, video_path, mask_path, out_path, w, h)
 
         out = deliver(out_path, job_input)
         out["detections"] = {
