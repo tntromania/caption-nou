@@ -146,9 +146,11 @@ print("[INIT] Florence-2 OK — worker gata", flush=True)
 # ═════════════════════════════════════════════════════════════════════════════
 # DETECȚIE
 # ═════════════════════════════════════════════════════════════════════════════
-def _clamp_box(x1, y1, x2, y2, w, h, pad=BOX_PAD):
-    x1 = max(0, int(x1) - pad); y1 = max(0, int(y1) - pad)
-    x2 = min(w, int(x2) + pad); y2 = min(h, int(y2) + pad)
+def _clamp_box(x1, y1, x2, y2, w, h, pad=BOX_PAD, pad_x=None, pad_y=None):
+    px = pad if pad_x is None else pad_x
+    py = pad if pad_y is None else pad_y
+    x1 = max(0, int(x1) - px); y1 = max(0, int(y1) - py)
+    x2 = min(w, int(x2) + px); y2 = min(h, int(y2) + py)
     if x2 - x1 < 4 or y2 - y1 < 4:
         return None
     return (x1, y1, x2, y2)
@@ -168,7 +170,13 @@ def detect_text_ocr(frame_bgr, w, h):
             continue
         pts = np.array(bbox, dtype=np.float32) / scale
         x, y, bw, bh = cv2.boundingRect(pts.astype(np.int32))
-        b = _clamp_box(x, y, x + bw, y + bh, w, h)
+        # Padding PROPORȚIONAL cu înălțimea textului (nu 6px fix): box-urile EasyOCR
+        # sunt strânse fix pe glife, iar prima/ultima literă ies adesea în afara lor
+        # (fonturi mari, litere cu diacritice/descendente, pop-in animat între
+        # keyframes) → rămâneau arse în video. Orizontal ~o lățime de literă.
+        pad_x = max(BOX_PAD, int(round(bh * 0.55)))
+        pad_y = max(BOX_PAD, int(round(bh * 0.30)))
+        b = _clamp_box(x, y, x + bw, y + bh, w, h, pad_x=pad_x, pad_y=pad_y)
         if b:
             boxes.append(b)
     return boxes
@@ -428,7 +436,11 @@ def finalize(result_path, original_path, mask_path, out_path, w, h):
     Înainte, TOT videoul era upscalat din rezoluția de procesare (~576p) —
     acum doar pixelii de sub mască vin din inpaint, restul rămân 1:1 originali.
     Masca e binarizată explicit (lut) fiindcă mp4-ul ei e limited-range
-    (alb = Y 235, nu 255 → ar lăsa 8% din textul original să transpară)."""
+    (alb = Y 235, nu 255 → ar lăsa 8% din textul original să transpară).
+    Masca e apoi DILATATĂ ~9px (gblur mare + prag jos) înainte de feather:
+    compozitarea folosea masca brută, strânsă pe box-urile OCR, deși inpainting-ul
+    curăța mai lat (mask_dilation=8) → marginile literelor (prima/ultima din cuvânt)
+    rămâneau vizibile din originalul full-res."""
     subprocess.run([
         "ffmpeg", "-y", "-nostats", "-loglevel", "error",
         "-i", original_path,
@@ -436,7 +448,8 @@ def finalize(result_path, original_path, mask_path, out_path, w, h):
         "-i", mask_path,
         "-filter_complex",
         f"[1:v]scale={w}:{h}:flags=lanczos,setsar=1,format=yuva420p[res];"
-        f"[2:v]scale={w}:{h},format=gray,lut=c0='if(gt(val,40),255,0)',gblur=sigma=2[m];"
+        f"[2:v]scale={w}:{h},format=gray,lut=c0='if(gt(val,40),255,0)',"
+        f"gblur=sigma=6,lut=c0='if(gt(val,16),255,0)',gblur=sigma=2[m];"
         f"[res][m]alphamerge[ov];"
         f"[0:v][ov]overlay=shortest=1,format=yuv420p[out]",
         "-map", "[out]", "-map", "0:a:0?",
