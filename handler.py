@@ -51,11 +51,11 @@ WEIGHTS_DIR      = os.environ.get("WEIGHTS_DIR", "/app/weights")
 DIFFUERASER_DIR  = os.environ.get("DIFFUERASER_DIR", "/app/DiffuEraser")
 
 # Greutățile BAKED în imagine au prioritate: dacă build-ul le conține deja
-# complete (markerul .easyocr.done e ultimul scris de download_weights.py),
+# complete (markerul .easyocr_zh.done e ultimul scris de download_weights.py),
 # ignorăm WEIGHTS_DIR extern (ex. Network Volume rămas setat pe endpoint)
 # → zero download la cold start, indiferent de mașină/volum.
 _BAKED_WEIGHTS = "/app/weights"
-if WEIGHTS_DIR != _BAKED_WEIGHTS and os.path.exists(os.path.join(_BAKED_WEIGHTS, ".easyocr.done")):
+if WEIGHTS_DIR != _BAKED_WEIGHTS and os.path.exists(os.path.join(_BAKED_WEIGHTS, ".easyocr_zh.done")):
     print(f"[INIT] Greutăți baked în imagine → folosesc {_BAKED_WEIGHTS} (ignor WEIGHTS_DIR={WEIGHTS_DIR})", flush=True)
     WEIGHTS_DIR = _BAKED_WEIGHTS
 MAX_SECONDS      = float(os.environ.get("MAX_SECONDS", "90"))
@@ -68,6 +68,8 @@ OCR_CONF         = float(os.environ.get("OCR_CONF", "0.25"))
 STATIC_RATIO     = float(os.environ.get("STATIC_RATIO", "0.60"))     # % din keyframes ca un box să fie "static"
 MAX_BOX_AREA_PCT = float(os.environ.get("MAX_BOX_AREA_PCT", "0.25")) # ignoră box-uri > 25% din frame
 BOX_PAD          = int(os.environ.get("BOX_PAD", "6"))
+DRIFT_MAX_PCT    = float(os.environ.get("DRIFT_MAX_PCT", "0.04"))    # drift max al unui cluster (fracție din diagonală) ca să fie overlay, nu text pe obiect
+MASK_MAX_COVERAGE = float(os.environ.get("MASK_MAX_COVERAGE", "0.40")) # plafonul măștii pe un frame — peste, scoatem box-urile cele mai mari
 
 sys.path.insert(0, DIFFUERASER_DIR)
 
@@ -77,8 +79,9 @@ os.environ.setdefault("HF_HOME", os.path.join(WEIGHTS_DIR, "hf-cache"))
 os.environ.setdefault("EASYOCR_MODULE_PATH", os.path.join(WEIGHTS_DIR, "easyocr"))
 
 # Mod Network Volume: dacă greutățile lipsesc, le descărcăm O SINGURĂ DATĂ aici.
-# (.easyocr.done e ultimul marker scris de download_weights.py = descărcare completă)
-if not os.path.exists(os.path.join(WEIGHTS_DIR, ".easyocr.done")):
+# (.easyocr_zh.done e ultimul marker scris de download_weights.py = descărcare completă;
+#  markerul vechi .easyocr.done = imagine fără modelul chinezesc → re-rulăm downloadul)
+if not os.path.exists(os.path.join(WEIGHTS_DIR, ".easyocr_zh.done")):
     print(f"[INIT] Greutăți lipsă în {WEIGHTS_DIR} — le descarc acum (~15GB, o singură dată)...", flush=True)
     subprocess.run(
         [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_weights.py")],
@@ -118,8 +121,14 @@ print("[INIT] DiffuEraser + ProPainter OK", flush=True)
 
 print("[INIT] Încărcare EasyOCR...", flush=True)
 import easyocr
-OCR = easyocr.Reader(["en", "ro"], gpu=(DEVICE == "cuda"), verbose=False)
-print("[INIT] EasyOCR OK", flush=True)
+# DOUĂ cititoare: latin (en+ro, ca până acum) + chinez (ch_sim+en).
+# Sursele sunt Douyin/RedNote/TikTok: caption-urile chinezești citite de modelul
+# latin ieșeau gunoi cu conf<0.25 → nu se ștergeau NICIODATĂ. Modelul ch_sim le
+# citește, dar dă conf ~0 chiar când citește corect → pragul de conf nu se aplică
+# ideogramelor (vezi detect_text_ocr); latinul păstrează pragul normal.
+OCR     = easyocr.Reader(["en", "ro"], gpu=(DEVICE == "cuda"), verbose=False)
+OCR_ZH  = easyocr.Reader(["ch_sim", "en"], gpu=(DEVICE == "cuda"), verbose=False)
+print("[INIT] EasyOCR OK (en+ro, ch_sim+en)", flush=True)
 
 print("[INIT] Încărcare Florence-2...", flush=True)
 from unittest.mock import patch
@@ -156,20 +165,42 @@ def _clamp_box(x1, y1, x2, y2, w, h, pad=BOX_PAD, pad_x=None, pad_y=None):
     return (x1, y1, x2, y2)
 
 
+_CJK_RE = None
+def _has_cjk(text):
+    global _CJK_RE
+    if _CJK_RE is None:
+        import re
+        _CJK_RE = re.compile(r"[㐀-䶿一-鿿]")
+    return bool(_CJK_RE.search(text))
+
+
 def detect_text_ocr(frame_bgr, w, h):
-    """EasyOCR pe un frame → listă de box-uri (x1,y1,x2,y2). Downscale pt viteză."""
+    """EasyOCR pe un frame → listă de box-uri (x1,y1,x2,y2). Downscale pt viteză.
+    Rulează AMBELE cititoare: latin cu prag de conf normal; din cel chinezesc se
+    păstrează doar box-urile cu ideograme, FĂRĂ prag de conf — ch_sim raportează
+    conf ~0 chiar la citiri corecte, iar pt ștergere contează regiunea, nu textul."""
     scale = 1.0
     img = frame_bgr
     if w > 1280:
         scale = 1280.0 / w
         img = cv2.resize(frame_bgr, (1280, int(h * scale)))
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    boxes = []
+
+    hits = []
     for (bbox, text, conf) in OCR.readtext(rgb, detail=1):
-        if conf < OCR_CONF or not str(text).strip():
-            continue
+        if conf >= OCR_CONF and str(text).strip():
+            hits.append(bbox)
+    for (bbox, text, conf) in OCR_ZH.readtext(rgb, detail=1):
+        if _has_cjk(str(text)):
+            hits.append(bbox)
+
+    boxes = []
+    for bbox in hits:
         pts = np.array(bbox, dtype=np.float32) / scale
         x, y, bw, bh = cv2.boundingRect(pts.astype(np.int32))
+        # un „text" mai mare de 25% din frame = fals pozitiv OCR (aceeași regulă ca la Florence)
+        if bw * bh > w * h * MAX_BOX_AREA_PCT:
+            continue
         # Padding PROPORȚIONAL cu înălțimea textului (nu 6px fix): box-urile EasyOCR
         # sunt strânse fix pe glife, iar prima/ultima literă ies adesea în afara lor
         # (fonturi mari, litere cu diacritice/descendente, pop-in animat între
@@ -223,12 +254,37 @@ def _iou(a, b):
     return inter / float(area_a + area_b - inter)
 
 
-def group_static_boxes(per_frame_boxes, min_ratio, n_frames_detected):
+def _anchor_drift(members):
+    """Cât de mult „călătorește" un cluster prin cadru (px).
+    Textul ARS pe ecran stă pe loc — dar când fraza se schimbă, box-ul își schimbă
+    lățimea; în funcție de aliniere rămâne fixă marginea stângă / centrul / dreapta.
+    Luăm deci pe fiecare axă MINIMUL intervalului de variație dintre cele 3 ancore
+    (min / centru / max) — dacă și cea mai stabilă ancoră se plimbă mult, textul e
+    lipit de un obiect din scenă (tricou, produs, mașină), nu de ecran."""
+    def spread(vals):
+        return max(vals) - min(vals)
+    xs1 = [b[0] for _, b in members]; xs2 = [b[2] for _, b in members]
+    ys1 = [b[1] for _, b in members]; ys2 = [b[3] for _, b in members]
+    cxs = [(a + b) / 2 for a, b in zip(xs1, xs2)]
+    cys = [(a + b) / 2 for a, b in zip(ys1, ys2)]
+    dx = min(spread(xs1), spread(cxs), spread(xs2))
+    dy = min(spread(ys1), spread(cys), spread(ys2))
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def group_static_boxes(per_frame_boxes, min_ratio, n_frames_detected, frame_diag=None):
     """
     Grupează box-urile care apar (IoU>0.5) în ≥min_ratio din keyframes → statice.
     Returnează (static_boxes, per_frame_dynamic).
+
+    Anti-distrugere (fix „video terci pe RedNote"):
+      • clusterele care DERIVEAZĂ prin cadru (text pe haine/obiecte filmate) se
+        ARUNCĂ — nu-s overlay ars, iar inpainting-ul lor tocă subiectul video;
+      • box-urile dinamice folosesc box-ul DETECTAT la fiecare keyframe, nu
+        union-ul clusterului — union-ul creștea în lanț (IoU cu el însuși) până
+        acoperea jumătate de frame și se ștanța pe toate cadrele din interval.
     """
-    clusters = []  # fiecare: {"box": union, "hits": set(frame_idx)}
+    clusters = []  # fiecare: {"box": union (doar pt matching/static), "hits": set, "members": [(fi, box)]}
     for fi, boxes in per_frame_boxes.items():
         for b in boxes:
             placed = False
@@ -238,18 +294,27 @@ def group_static_boxes(per_frame_boxes, min_ratio, n_frames_detected):
                     x2 = max(c["box"][2], b[2]); y2 = max(c["box"][3], b[3])
                     c["box"] = (x1, y1, x2, y2)
                     c["hits"].add(fi)
+                    c["members"].append((fi, b))
                     placed = True
                     break
             if not placed:
-                clusters.append({"box": b, "hits": {fi}})
+                clusters.append({"box": b, "hits": {fi}, "members": [(fi, b)]})
 
     static, dynamic = [], {fi: [] for fi in per_frame_boxes}
+    n_drifting = 0
     for c in clusters:
+        if frame_diag and len(c["members"]) >= 3:
+            drift = _anchor_drift(c["members"])
+            if drift > DRIFT_MAX_PCT * frame_diag:
+                n_drifting += 1
+                continue
         if len(c["hits"]) >= max(2, min_ratio * n_frames_detected):
             static.append(c["box"])
         else:
-            for fi in c["hits"]:
-                dynamic[fi].append(c["box"])
+            for fi, b in c["members"]:
+                dynamic[fi].append(b)
+    if n_drifting:
+        print(f"[DETECT] {n_drifting} cluster(e) în mișcare ignorate (text pe obiecte, nu overlay)", flush=True)
     return static, dynamic
 
 
@@ -286,10 +351,11 @@ def run_detection(video_path, w, h, fps, n_frames, targets, extra_prompts):
     cap.release()
 
     n_kf = max(1, len(kf_indices))
+    frame_diag = (w * w + h * h) ** 0.5
     static_boxes, dynamic_by_kf = [], {fi: [] for fi in kf_indices}
 
     if ocr_hits:
-        ocr_static, ocr_dyn = group_static_boxes(ocr_hits, STATIC_RATIO, len(ocr_hits))
+        ocr_static, ocr_dyn = group_static_boxes(ocr_hits, STATIC_RATIO, len(ocr_hits), frame_diag)
         # dacă userul NU vrea captions, păstrăm din OCR doar textul STATIC (watermark text)
         if "captions" in targets:
             for fi, bs in ocr_dyn.items():
@@ -299,8 +365,14 @@ def run_detection(video_path, w, h, fps, n_frames, targets, extra_prompts):
     if flo_hits:
         # Florence: logo/watermark = static prin definiție → cerem persistență în
         # ≥50% din frame-urile Florence ca să eliminăm halucinațiile pe obiecte
-        flo_static, _flo_dyn = group_static_boxes(flo_hits, 0.5, len(flo_hits))
+        flo_static, _flo_dyn = group_static_boxes(flo_hits, 0.5, len(flo_hits), frame_diag)
         static_boxes += flo_static
+
+    # union-ul unui cluster static nu are voie să depășească plafonul de arie —
+    # un „watermark" de un sfert de ecran e o grupare scăpată de sub control
+    frame_area = float(w * h)
+    static_boxes = [b for b in static_boxes
+                    if (b[2] - b[0]) * (b[3] - b[1]) <= frame_area * MAX_BOX_AREA_PCT]
 
     n_static = len(static_boxes)
     n_dynamic = sum(len(v) for v in dynamic_by_kf.values())
@@ -341,14 +413,31 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
     for (x1, y1, x2, y2) in static_boxes:
         base_static[y1:y2, x1:x2] = 255
 
+    n_capped = 0
     for fidx in range(n_frames):
+        boxes = boxes_for_frame(fidx)
         mask = base_static.copy()
-        for (x1, y1, x2, y2) in boxes_for_frame(fidx):
+        for (x1, y1, x2, y2) in boxes:
             mask[y1:y2, x1:x2] = 255
+        # plasă de siguranță: dacă masca ar acoperi >MASK_MAX_COVERAGE din frame,
+        # inpainting-ul nu mai are din ce reconstrui → scoatem box-urile cele mai
+        # mari până coborâm sub plafon (mai bine rămâne puțin text decât video terci)
+        if mask.mean() / 255.0 > MASK_MAX_COVERAGE:
+            n_capped += 1
+            boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))  # crescător după arie
+            while boxes:
+                mask = base_static.copy()
+                for (x1, y1, x2, y2) in boxes:
+                    mask[y1:y2, x1:x2] = 255
+                if mask.mean() / 255.0 <= MASK_MAX_COVERAGE:
+                    break
+                boxes.pop()  # scoate box-ul cel mai mare (ultimul)
         if mask.any():
             total_active += 1
         cv2.imwrite(os.path.join(png_dir, f"{fidx:06d}.png"), mask,
                     [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    if n_capped:
+        print(f"[MASK] {n_capped} frame-uri plafonate la {MASK_MAX_COVERAGE:.0%} (box-urile cele mai mari scoase)", flush=True)
 
     subprocess.run([
         "ffmpeg", "-y", "-nostats", "-loglevel", "error",

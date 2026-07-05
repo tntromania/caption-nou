@@ -69,11 +69,19 @@ if not os.path.exists(done_marker("florence")):
     snapshot_download(os.environ.get("FLORENCE_MODEL", "microsoft/Florence-2-large"))
     mark_done("florence")
 
-# 7. EasyOCR (en + ro) — descarcă modelele de detecție/recunoaștere
+# 7. EasyOCR — AMBELE cititoare folosite de handler: latin (en+ro) + chinez
+#    (ch_sim+en). Marker NOU (easyocr_zh) ca marker final: imaginile/volumele
+#    vechi (doar en+ro) nu au modelul chinezesc → lipsa markerului forțează
+#    descărcarea lui la primul start.
 if not os.path.exists(done_marker("easyocr")):
     print("[DL] EasyOCR en+ro")
     import easyocr
     easyocr.Reader(["en", "ro"], gpu=False, verbose=False)
     mark_done("easyocr")
+if not os.path.exists(done_marker("easyocr_zh")):
+    print("[DL] EasyOCR ch_sim+en")
+    import easyocr
+    easyocr.Reader(["ch_sim", "en"], gpu=False, verbose=False)
+    mark_done("easyocr_zh")
 
 print("✅ Toate greutățile sunt descărcate.")
