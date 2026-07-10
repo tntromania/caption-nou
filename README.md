@@ -1,6 +1,6 @@
 # auto-eraser-worker
 
-<!-- build: v2.0 — greutăți baked în imagine + torch 2.7/cu128 (Blackwell) -->
+<!-- build: v3.0 — greutăți pe Network Volume (imagine mică, release-uri rapide) + torch 2.7/cu128 (Blackwell) -->
 
 Worker RunPod Serverless: ștderge **automat** captions, logo-uri și watermark-uri din video.
 Detecție: EasyOCR (text, pe keyframes) + Florence-2 (logo/watermark, open-vocabulary).
@@ -18,9 +18,11 @@ per aplicație.
 3. Config endpoint:
    - GPU: 24 GB (RTX 4090 / 5090 / L4 / A5000); pt 1080p full: L40S 48GB.
      torch 2.7 + cu128 → merge inclusiv pe Blackwell/RTX 50xx.
-   - Container Disk: 60 GB (imaginea are ~35GB — greutățile sunt BAKED în ea)
-   - Network Volume: NU mai e nevoie (greutățile vin în imagine; dacă volumul
-     și `WEIGHTS_DIR` rămân setate, handler-ul le ignoră — poți să le scoți)
+   - Container Disk: 30 GB (imaginea ~12GB + temp la procesare)
+   - Network Volume: **OBLIGATORIU** (~30GB, în același datacenter cu endpointul).
+     Greutățile (~15GB) se descarcă pe el o singură dată la primul start
+     (`WEIGHTS_DIR=/runpod-volume/weights` e setat din imagine); fără volum,
+     fiecare cold start le-ar re-descărca.
    - Idle Timeout: 120s · Execution Timeout: 1800s
 
 ## API

@@ -1,16 +1,20 @@
 # Dockerfile — AUTO Eraser (RunPod Serverless)
 # Detecție automată (EasyOCR + Florence-2) + Inpainting (ProPainter + DiffuEraser)
 #
-# Imaginea conține TOT: cod + greutăți (~15GB, descărcate la BUILD) → zero
-# download la cold start, pe orice mașină. Nu mai e nevoie de Network Volume;
-# dacă endpointul mai are WEIGHTS_DIR setat pe volum, handler-ul îl ignoră
-# când găsește greutățile complete în imagine.
+# Greutățile NU mai sunt în imagine (v2 le avea baked → layer de ~27GB pe care
+# fiecare mașină nouă îl trăgea la fiecare release/scalare, 5-8 min de
+# "initializing"). Acum stau pe Network Volume (WEIGHTS_DIR=/runpod-volume/weights):
+# handler-ul le descarcă O SINGURĂ DATĂ pe volum la primul start, apoi toți
+# workerii din datacenter le montează instant. Imaginea rămâne mică → pull
+# rapid pe mașini noi, release-uri de handler aproape instant.
+# ⚠️ Endpointul TREBUIE să aibă Network Volume atașat înainte de deploy-ul
+# acestei imagini, altfel greutățile se re-descarcă la fiecare cold start.
 #
 # PyTorch 2.7 + CUDA 12.8 → kernele pentru toate GPU-urile, inclusiv
 # Blackwell/RTX 50xx (sm_120) — fix pentru "no kernel image is available".
 #
 # GPU recomandat: 24GB+ (RTX 4090 / 5090 / L4 / A5000; pt 1080p full: L40S).
-# Container Disk: minim 60 GB (imagine ~35GB + temp la procesare).
+# Container Disk: 30 GB ajunge (imagine ~12GB + temp la procesare).
 
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
@@ -41,13 +45,12 @@ RUN git clone --depth 1 https://github.com/lixiaowen-xw/DiffuEraser.git /app/Dif
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 3. Greutățile — BAKED în imagine la build: SD1.5 + VAE + DiffuEraser + PCM
-#    + ProPainter + Florence-2 + EasyOCR (~15GB). Build-ul durează mai mult,
-#    dar workerii pornesc fără niciun download, exact ca la captionremover.
-ENV WEIGHTS_DIR=/app/weights
+# 3. Greutățile — pe Network Volume: handler.py rulează download_weights.py
+#    la primul start dacă nu găsește markerul .easyocr_zh.done în WEIGHTS_DIR
+#    (~15GB, o singură dată per volum, apoi persistă).
+ENV WEIGHTS_DIR=/runpod-volume/weights
 ENV DIFFUERASER_DIR=/app/DiffuEraser
 COPY download_weights.py .
-RUN python download_weights.py
 
 # 4. Handler
 COPY handler.py .
