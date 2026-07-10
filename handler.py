@@ -39,6 +39,11 @@ import traceback
 
 import gc
 
+# alocatorul CUDA cu segmente expandabile reduce fragmentarea — OOM-urile
+# ProPainter arătau 1-2GB "reserved but unallocated"; trebuie setat ÎNAINTE
+# de importul torch ca să fie citit de alocator
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import runpod
 import requests
 import numpy as np
@@ -61,7 +66,9 @@ if WEIGHTS_DIR != _BAKED_WEIGHTS and os.path.exists(os.path.join(_BAKED_WEIGHTS,
 MAX_SECONDS      = float(os.environ.get("MAX_SECONDS", "90"))
 MAX_FPS          = int(os.environ.get("MAX_FPS", "30"))              # 60fps → 30fps: jumătate din cadre = jumătate din VRAM/timp
 PROC_MAX_SIDE    = int(os.environ.get("PROC_MAX_SIDE", "640"))       # latura lungă la care rulează inpainting-ul
-PROC_FRAME_BUDGET = int(os.environ.get("PROC_FRAME_BUDGET", "1200")) # peste atât, rezoluția scade proporțional (VRAM ~ cadre × pixeli)
+PROC_FRAME_BUDGET = int(os.environ.get("PROC_FRAME_BUDGET", "600"))  # peste atât, rezoluția scade proporțional (VRAM ~ cadre × pixeli);
+                                                                     # 1200 dădea OOM pe 24GB la 1800+ cadre (~274M px·cadre) — 600 ține
+                                                                     # produsul în zona dovedită sigură (~138M, cât joburile care au mers)
 DETECT_INTERVAL  = float(os.environ.get("DETECT_INTERVAL", "0.5"))   # secunde între keyframes OCR
 FLORENCE_INTERVAL = float(os.environ.get("FLORENCE_INTERVAL", "2.0")) # secunde între keyframes Florence
 OCR_CONF         = float(os.environ.get("OCR_CONF", "0.25"))
@@ -350,6 +357,11 @@ def run_detection(video_path, w, h, fps, n_frames, targets, extra_prompts):
         idx += step_ocr
     cap.release()
 
+    # zero cadre citite = video nedecodabil, NU "nimic detectat" — altfel jobul
+    # raportează succes fals și clientul retrimite la nesfârșit
+    if not kf_indices:
+        raise ValueError("Nu am putut citi niciun cadru din video (decodare eșuată)")
+
     n_kf = max(1, len(kf_indices))
     frame_diag = (w * w + h * h) ** 0.5
     static_boxes, dynamic_by_kf = [], {fi: [] for fi in kf_indices}
@@ -479,27 +491,32 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, qua
 
     pw, ph = _proc_size(w, h, n_frames)
     print(f"[INPAINT] ProPainter priori @ {pw}x{ph} ({n_frames} cadre)...", flush=True)
-    try:
+
+    def _priori(width, height):
         # resize_ratio=1.0 + width/height explicite → dezactivăm downscale-ul
         # intern nedeterminist al DiffuEraser (default 0.6, ×0.5 peste 960px)
         PROPAINTER.forward(
             video_path, mask_path, priori_path,
-            resize_ratio=1.0, width=pw, height=ph,
+            resize_ratio=1.0, width=width, height=height,
             video_length=video_length,
             ref_stride=10, neighbor_length=10, subvideo_length=50,
             mask_dilation=8,
         )
+
+    oom = False
+    try:
+        _priori(pw, ph)
     except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache(); gc.collect()
+        # NU reîncercăm aici: cât timp suntem în except, traceback-ul activ ține
+        # referințe la tensorii din ProPainter → empty_cache() nu poate elibera
+        # VRAM-ul și retry-ul murea tot cu OOM ("22.5 GiB in use" la reîncercare)
+        oom = True
+    if oom:
+        gc.collect()
+        torch.cuda.empty_cache()
         pw, ph = max(64, int(pw * 0.6)) // 2 * 2, max(64, int(ph * 0.6)) // 2 * 2
         print(f"[INPAINT] CUDA OOM → reîncerc la {pw}x{ph}", flush=True)
-        PROPAINTER.forward(
-            video_path, mask_path, priori_path,
-            resize_ratio=1.0, width=pw, height=ph,
-            video_length=video_length,
-            ref_stride=10, neighbor_length=10, subvideo_length=50,
-            mask_dilation=8,
-        )
+        _priori(pw, ph)
     if quality != "max":
         print("[INPAINT] quality=fast → sar peste DiffuEraser", flush=True)
         if DEVICE == "cuda":
@@ -569,23 +586,57 @@ def fetch_video(job_input, workdir):
     return video_path
 
 
-def normalize_fps(video_path, workdir):
-    """DiffuEraser cere fps IDENTIC între video, mască și priori (read_priori
-    compară strict și aruncă "The frame rate of all input videos needs to be
-    consistent."). FPS-urile fracționare din filmări de telefon (ex. 30.05,
+# codecuri pe care lanțul cv2/ffmpeg/imageio le decodează sigur; AV1 (TikTok/
+# Douyin) dădea "Get current frame error" în OpenCV → zero cadre citite →
+# jobul raporta fals "nothing_detected" și clientul reîncerca la nesfârșit,
+# plătind un cold start GPU pentru fiecare încercare
+SAFE_CODECS = {"h264", "hevc", "mpeg4", "mjpeg", "vp8", "vp9"}
+
+
+def _probe_codec(video_path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return (out.stdout or "").strip().splitlines()[0].lower() if (out.stdout or "").strip() else ""
+    except Exception:
+        return ""
+
+
+def _can_read_frame(video_path):
+    cap = cv2.VideoCapture(video_path)
+    ok, _ = cap.read()
+    cap.release()
+    return ok
+
+
+def normalize_input(video_path, workdir):
+    """Normalizează inputul o singură dată, la intrare — două motive:
+
+    FPS: DiffuEraser cere fps IDENTIC între video, mască și priori (read_priori
+    compară strict). FPS-urile fracționare din filmări de telefon (ex. 30.05,
     29.97) se cuantizează diferit prin lanțul cv2/ffmpeg/imageio → re-eșantionăm
-    inputul la fps ÎNTREG constant (CFR), o singură dată, la intrare.
-    Plafonăm la MAX_FPS (default 30): la 60fps un clip de 27s = 1600+ cadre →
-    ProPainter le ține pe toate în VRAM și dă CUDA OOM pe 24GB."""
+    la fps ÎNTREG constant (CFR), plafonat la MAX_FPS (60fps = dublu VRAM → OOM).
+
+    CODEC: OpenCV nu decodează AV1 (metadatele merg, cadrele nu) → transcodăm
+    în H.264 cu ffmpeg-ul de sistem (are dav1d). Dacă nici acesta nu poate
+    decoda, aruncăm eroare EXPLICITĂ — niciodată succes fals."""
+    codec = _probe_codec(video_path)
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
     target = max(10, min(MAX_FPS, int(round(fps)) or 30))
-    if abs(fps - target) < 0.01:
+
+    bad_codec = codec not in SAFE_CODECS or not _can_read_frame(video_path)
+    if not bad_codec and abs(fps - target) < 0.01:
         return video_path
+
     norm_path = os.path.join(workdir, "input_cfr.mp4")
-    print(f"[NORM] {fps:.3f}fps → {target}fps CFR", flush=True)
-    subprocess.run([
+    print(f"[NORM] codec={codec or '?'} {fps:.3f}fps → h264 {target}fps CFR", flush=True)
+    proc = subprocess.run([
         "ffmpeg", "-y", "-nostats", "-loglevel", "error",
         "-i", video_path,
         "-vf", f"fps={target}",
@@ -593,7 +644,14 @@ def normalize_fps(video_path, workdir):
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         norm_path,
-    ], check=True)
+    ], capture_output=True, text=True)
+    if proc.returncode != 0 or not _can_read_frame(norm_path):
+        if proc.stderr:
+            print(f"[NORM] ffmpeg stderr: {proc.stderr[-400:]}", flush=True)
+        raise ValueError(
+            f"Nu pot decoda videoul (codec: {codec or 'necunoscut'}). "
+            "Re-exportă-l ca MP4 (H.264) și încearcă din nou."
+        )
     return norm_path
 
 
@@ -642,12 +700,17 @@ def handler(job):
         quality = str(job_input.get("quality") or "fast").lower()
 
         video_path = fetch_video(job_input, workdir)
-        video_path = normalize_fps(video_path, workdir)
-        w, h, fps, n_frames, duration = probe(video_path)
-        print(f"[JOB] {w}x{h} @ {fps:.2f}fps, {n_frames} frames, {duration:.1f}s, targets={targets}, quality={quality}", flush=True)
 
+        # durata se verifică pe originalul brut, ÎNAINTE de transcodare — nu
+        # plătim normalize pentru un video pe care oricum îl respingem
+        # (metadatele cv2 merg și pe codecuri pe care nu le putem decoda)
+        _, _, _, _, duration = probe(video_path)
         if duration > MAX_SECONDS:
             return {"error": f"Video prea lung ({duration:.0f}s). Maxim: {MAX_SECONDS:.0f}s."}
+
+        video_path = normalize_input(video_path, workdir)
+        w, h, fps, n_frames, duration = probe(video_path)
+        print(f"[JOB] {w}x{h} @ {fps:.2f}fps, {n_frames} frames, {duration:.1f}s, targets={targets}, quality={quality}", flush=True)
 
         static_boxes, dynamic_by_kf, kf_indices = run_detection(
             video_path, w, h, fps, n_frames, targets, extra_prompts
