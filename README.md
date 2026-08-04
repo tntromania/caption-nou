@@ -54,5 +54,35 @@ aplicația ta trebuie să aibă endpointul de recepție (vezi `/api/receive-ai-r
 serverul AUTO Eraser).
 
 ### Env tuning (opțional, pe endpoint)
-`MAX_SECONDS` (90) · `DETECT_INTERVAL` (0.5) · `FLORENCE_INTERVAL` (2.0) ·
-`OCR_CONF` (0.25) · `STATIC_RATIO` (0.60) · `MAX_BOX_AREA_PCT` (0.25)
+
+**Detecție:** `MAX_SECONDS` (90) · `DETECT_INTERVAL` (0.5) · `FLORENCE_INTERVAL` (2.0) ·
+`OCR_CONF` (0.25) · `STATIC_RATIO` (0.60) · `MAX_BOX_AREA_PCT` (0.25) ·
+`BOX_PAD` (6) · `DRIFT_MAX_PCT` (0.04) · `MASK_MAX_COVERAGE` (0.25)
+
+**Calitate inpainting:** `PROC_MAX_SIDE` (832) · `MIN_PROC_SIDE` (320) ·
+`MASK_DILATE_PX` (6) · `PXFRAMES_PER_GB` (5.0e6) · `CHUNK_OVERLAP` (12) ·
+`PROC_FRAME_BUDGET` (0 = derivat din VRAM) · `MAX_FPS` (30)
+
+#### Cum se alege rezoluția de inpainting
+
+Rezoluția **nu depinde de lungimea clipului**. Latura lungă țintește `PROC_MAX_SIDE`;
+clipurile prea lungi ca să încapă în VRAM se taie în bucăți temporale (cu
+`CHUNK_OVERLAP` cadre de context, aruncate la lipire), fiecare procesată la
+rezoluție plină.
+
+Bugetul de cadre per bucată se derivă din VRAM-ul real al plăcii
+(`VRAM_GB × PXFRAMES_PER_GB / (lățime × înălțime)`), nu dintr-o constantă.
+Calibrarea: ~138M px·cadre erau dovediți siguri pe 24GB → ~5.75M px·cadre/GB,
+din care luăm 5.0M ca marjă.
+
+> Varianta veche scădea rezoluția cu `sqrt(600/cadre)` pe tot videoul. Un clip de
+> 78s la 720x1280 ajungea reconstruit la **182x324** și ridicat înapoi cu lanczos
+> de 3.95x (= blur vizibil), iar `mask_dilation=8` aplicat la acea rezoluție
+> ștergea efectiv **32px** la rezoluția reală. Acum același clip se procesează la
+> 468x832 în bucăți, iar dilatarea e exprimată în pixeli la rezoluția originală
+> (`MASK_DILATE_PX`) și convertită la scara de procesare.
+
+`MASK_DILATE_PX` e cât dilată inpainting-ul masca, **în pixeli la rezoluția
+originală** — crește-l dacă rămân margini de litere, scade-l dacă șterge prea lat.
+Compozitarea din `finalize()` mai adaugă doar ~2px + feather (înainte ~9px, care
+se adunau peste dilatarea ProPainter).
