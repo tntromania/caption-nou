@@ -18,6 +18,16 @@
 
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
+# Imaginea de bază pune NVIDIA_REQUIRE_CUDA=cuda>=12.8. nvidia-container-cli
+# verifică asta ÎNAINTE de orice, la init-ul containerului, și pe un host cu
+# driver < 570 refuză să pornească:
+#   "requirement error: unsatisfied condition: cuda>=12.8"
+# Containerul nu ajunge niciodată la Python → workerul nu devine ready →
+# joburile stau în coadă la infinit. Wheel-urile PyTorch cu128 își aduc
+# runtime-ul CUDA cu ele și rulează prin CUDA minor version compatibility pe
+# orice driver din seria 12.x (>= 525), deci gardul de 12.8 e inutil de strict.
+ENV NVIDIA_REQUIRE_CUDA="cuda>=12.0"
+
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
