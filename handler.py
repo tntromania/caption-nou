@@ -129,19 +129,50 @@ if os.path.realpath(_local_weights) != os.path.realpath(WEIGHTS_DIR):
         os.symlink(WEIGHTS_DIR, _local_weights)
         print(f"[INIT] Symlink {_local_weights} → {WEIGHTS_DIR}", flush=True)
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def _cuda_usable():
+    """CUDA chiar merge? `is_available()` singur nu ajunge: pe unele mașini din
+    fleet driverul e mai vechi decât runtime-ul și abia PRIMA alocare crapă cu
+    „Error code: 804 — forward compatibility was attempted on non supported HW".
+    Verificarea de fitness a RunPod-ului o prinde, dar doar o raportează ca
+    warning și lasă workerul să pornească. Deci o facem noi, explicit."""
+    if not torch.cuda.is_available():
+        return False, "torch.cuda.is_available() = False"
+    try:
+        torch.zeros(1024, 1024, device="cuda").sum().item()
+        torch.cuda.synchronize()
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+# Fără GPU acest worker NU are voie să accepte joburi. Pe CPU, detecția
+# (EasyOCR + Florence-2) și ProPainter merg de 10-20× mai lent: în loguri, un
+# clip de 19s a stat 353s doar în DETECT și n-a terminat niciodată — jobul
+# expira sau workerul se reciclă, clientul retrimite, iar GPU-time-ul se
+# facturează integral pentru zero rezultat. Mai bine murim la pornire: RunPod
+# marchează workerul nesănătos și mută jobul pe altă mașină, în câteva secunde.
+_CUDA_OK, _CUDA_WHY = _cuda_usable()
+ALLOW_CPU = os.environ.get("ALLOW_CPU", "0") == "1"
+
+DEVICE = "cuda" if _CUDA_OK else "cpu"
 DTYPE  = torch.float16 if DEVICE == "cuda" else torch.float32
 
 # VRAM-ul real al plăcii — bugetul de inpainting se derivă din el, nu dintr-o
 # constantă calibrată pentru 24GB. Fără printul ăsta nu se putea vedea din
 # loguri pe ce GPU rulează endpointul (workerul LaMa îl scrie, ăsta nu-l scria).
-if DEVICE == "cuda":
+if _CUDA_OK:
     _PROPS = torch.cuda.get_device_properties(0)
     VRAM_GB = _PROPS.total_memory / (1024 ** 3)
     print(f"[INIT] GPU: {_PROPS.name} — {VRAM_GB:.0f}GB VRAM, sm_{_PROPS.major}{_PROPS.minor}", flush=True)
 else:
     VRAM_GB = 8.0
-    print("[INIT] GPU indisponibil — rulez pe CPU (foarte lent)", flush=True)
+    print(f"[INIT] ❌ GPU INDISPONIBIL pe mașina asta — {_CUDA_WHY}", flush=True)
+    if not ALLOW_CPU:
+        print("[INIT] ❌ Refuz să pornesc pe CPU (ar arde minute de GPU-time "
+              "facturat pentru joburi care oricum nu se termină). "
+              "Setează ALLOW_CPU=1 dacă chiar vrei asta.", flush=True)
+        sys.exit(1)
+    print("[INIT] ⚠ ALLOW_CPU=1 — rulez pe CPU (foarte lent)", flush=True)
 
 
 def _probe_nvenc():
@@ -932,6 +963,13 @@ def deliver(out_path, job_input):
 # ═════════════════════════════════════════════════════════════════════════════
 def handler(job):
     job_input = job.get("input", {}) or {}
+    # Plasa de siguranță pentru cazul în care CUDA moare DUPĂ pornire (driver
+    # reset, GPU scos de sub container). Fără ea, jobul ar continua pe CPU și ar
+    # ține workerul ocupat zeci de minute; așa pică în 2s și clientul îl poate
+    # relua imediat pe altă mașină.
+    if DEVICE != "cuda":
+        return {"error": "Worker fără GPU disponibil — reia jobul (se va aloca altă mașină)."}
+    t_job = time.time()
     workdir = tempfile.mkdtemp(prefix="autoeraser_")
     try:
         targets = job_input.get("targets") or ["captions", "logos", "watermarks"]
@@ -983,6 +1021,9 @@ def handler(job):
             "dynamic_hits": n_dynamic,
             "keyframes": len(kf_indices),
         }
+        # timpul total pe job = ce se facturează; fără el nu se vede din loguri
+        # dacă un endpoint a devenit brusc de 5× mai scump
+        print(f"[JOB] gata în {time.time() - t_job:.1f}s ({duration:.1f}s video)", flush=True)
         return out
 
     except Exception as e:
