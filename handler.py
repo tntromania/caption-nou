@@ -85,6 +85,12 @@ PXFRAMES_PER_GB  = float(os.environ.get("PXFRAMES_PER_GB", "5.0e6"))
 CHUNK_OVERLAP    = int(os.environ.get("CHUNK_OVERLAP", "12"))        # cadre de suprapunere între bucăți (continuitate temporală)
 # Cap explicit pe cadre/bucată. Gol = derivat din VRAM (recomandat).
 PROC_FRAME_BUDGET = int(os.environ.get("PROC_FRAME_BUDGET", "0"))
+# ── Decupaj pe banda de text (ROI) ───────────────────────────────────────────
+# Caption-urile stau într-o bandă, dar ProPainter primea cadrul întreg. La un
+# 720x1280 cu text jos, ~75% din pixelii măcinați n-aveau nicio mască pe ei.
+ROI_PAD_PCT      = float(os.environ.get("ROI_PAD_PCT", "0.18"))   # context în jurul benzii (din latura ei)
+ROI_MIN_PAD      = int(os.environ.get("ROI_MIN_PAD", "40"))       # dar niciodată mai puțin de atât, în px
+ROI_MAX_AREA_PCT = float(os.environ.get("ROI_MAX_AREA_PCT", "0.75"))  # peste atât, decupajul n-aduce nimic
 # Cât să dilate masca inpainting-ul, exprimat în pixeli la rezoluția ORIGINALĂ.
 # ProPainter primește valoarea convertită în pixeli de procesare, deci efectul
 # rămâne constant indiferent de scalare.
@@ -589,6 +595,10 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
     ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     n_capped = 0
+    # bounding box-ul UNIUNII tuturor măștilor, pe tot clipul: ProPainter n-are
+    # de ce să macine cadrul întreg când textul stă într-o bandă. Se calculează
+    # aici, după plafonare, ca să reflecte exact ce s-a desenat în mask.mp4.
+    ux1, uy1, ux2, uy2 = w, h, 0, 0
     try:
         for fidx in range(n_frames):
             boxes = boxes_for_frame(fidx)
@@ -610,6 +620,9 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
                     boxes.pop()  # scoate box-ul cel mai mare (ultimul)
             if mask.any():
                 total_active += 1
+                for (x1, y1, x2, y2) in ([b for b in boxes] + list(static_boxes)):
+                    ux1, uy1 = min(ux1, x1), min(uy1, y1)
+                    ux2, uy2 = max(ux2, x2), max(uy2, y2)
             proc.stdin.write(mask.tobytes())
     finally:
         proc.stdin.close()
@@ -621,7 +634,46 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
     if n_capped:
         print(f"[MASK] {n_capped} frame-uri plafonate la {MASK_MAX_COVERAGE:.0%} (box-urile cele mai mari scoase)", flush=True)
     print(f"[MASK] {n_frames} frames, {total_active} cu mască activă → {mask_path}", flush=True)
-    return total_active
+    roi = (ux1, uy1, ux2, uy2) if ux2 > ux1 and uy2 > uy1 else None
+    return total_active, roi
+
+
+def compute_roi(roi, w, h):
+    """Banda de inpainting: bbox-ul măștii + contur de context, aliniat la par.
+
+    ProPainter are nevoie de pixeli SĂNĂTOȘI în jurul găurii ca să aibă din ce
+    reconstrui, deci nu tăiem fix pe bbox. Dacă banda oricum acoperă aproape tot
+    cadrul, nu are rost decupajul — returnăm None și rulăm ca înainte."""
+    if not roi:
+        return None
+    x1, y1, x2, y2 = roi
+    pad_x = max(ROI_MIN_PAD, int((x2 - x1) * ROI_PAD_PCT))
+    pad_y = max(ROI_MIN_PAD, int((y2 - y1) * ROI_PAD_PCT))
+    x1 = max(0, x1 - pad_x); y1 = max(0, y1 - pad_y)
+    x2 = min(w, x2 + pad_x); y2 = min(h, y2 + pad_y)
+    # ffmpeg crop + encoderele vor dimensiuni pare
+    x1 -= x1 % 2; y1 -= y1 % 2
+    x2 -= (x2 - x1) % 2; y2 -= (y2 - y1) % 2
+    rw, rh = x2 - x1, y2 - y1
+    if rw < 64 or rh < 64:
+        return None
+    if (rw * rh) / float(w * h) > ROI_MAX_AREA_PCT:
+        print(f"[ROI] banda acoperă {(rw*rh)/float(w*h):.0%} din cadru — nu decupez", flush=True)
+        return None
+    print(f"[ROI] inpaint doar pe {rw}x{rh} @ ({x1},{y1}) = {(rw*rh)/float(w*h):.0%} din cadru "
+          f"(în loc de {w}x{h})", flush=True)
+    return (x1, y1, rw, rh)
+
+
+def crop_to_roi(src, dst, roi, lossless=False):
+    """Decupează un video la ROI. Masca trebuie lossless (margini binare)."""
+    x, y, rw, rh = roi
+    venc = ["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0"] if lossless else _venc(crf="16", preset="veryfast")
+    subprocess.run([
+        "ffmpeg", "-y", "-nostats", "-loglevel", "error", "-i", src,
+        "-vf", f"crop={rw}:{rh}:{x}:{y}", *venc, "-an", dst,
+    ], check=True)
+    return dst
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -803,7 +855,7 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, qua
     return result_path
 
 
-def finalize(result_path, original_path, mask_path, out_path, w, h):
+def finalize(result_path, original_path, mask_path, out_path, w, h, roi=None):
     """Compune rezultatul inpaint (procesat la rezoluție redusă) înapoi peste
     originalul full-res DOAR în zonele mascate + remux audio original.
     Înainte, TOT videoul era upscalat din rezoluția de procesare (~576p) —
@@ -817,6 +869,14 @@ def finalize(result_path, original_path, mask_path, out_path, w, h):
     rezoluția reală), deci aici e nevoie doar de ~2px + un feather scurt.
     Pragul de la începutul lanțului rămâne: mp4-ul măștii e limited-range
     (alb = Y 235, nu 255 → altfel 8% din textul original ar transpărea)."""
+    # Cu ROI, rezultatul acoperă doar banda de text: îl scalăm la dimensiunea ei
+    # și îl așezăm la offsetul din cadru. Restul cadrului rămâne negru, dar nu se
+    # vede niciodată — masca e 0 acolo prin construcție (ROI conține tot ce e mascat).
+    if roi:
+        rx, ry, rw, rh = roi
+        place = f"scale={rw}:{rh}:flags=lanczos,pad={w}:{h}:{rx}:{ry}"
+    else:
+        place = f"scale={w}:{h}:flags=lanczos"
     # gblur sigma=σ urmat de prag t dilată cu ≈ σ·Φ⁻¹(1−t/255) pixeli.
     # sigma=2 + prag 40 → ~2px. Feather-ul final rămâne subțire.
     subprocess.run([
@@ -825,7 +885,7 @@ def finalize(result_path, original_path, mask_path, out_path, w, h):
         "-i", result_path,
         "-i", mask_path,
         "-filter_complex",
-        f"[1:v]scale={w}:{h}:flags=lanczos,setsar=1,format=yuva420p[res];"
+        f"[1:v]{place},setsar=1,format=yuva420p[res];"
         f"[2:v]scale={w}:{h},format=gray,lut=c0='if(gt(val,40),255,0)',"
         f"gblur=sigma=2,lut=c0='if(gt(val,40),255,0)',gblur=sigma=1.5[m];"
         f"[res][m]alphamerge[ov];"
@@ -1006,14 +1066,27 @@ def handler(job):
         gc.collect()
 
         mask_path = os.path.join(workdir, "mask.mp4")
-        build_mask_video(mask_path, w, h, fps, n_frames,
-                         static_boxes, dynamic_by_kf, kf_indices, workdir)
+        _total_active, roi_raw = build_mask_video(mask_path, w, h, fps, n_frames,
+                                                  static_boxes, dynamic_by_kf, kf_indices, workdir)
 
-        result_path = run_inpainting(video_path, mask_path, workdir, duration,
-                                     max_img_size, quality, w, h, n_frames, fps)
+        # Inpainting DOAR pe banda de text. Câștigul e dublu: mai puțini pixeli
+        # de măcinat (deci mai ieftin) și, la același PROC_MAX_SIDE, banda intră
+        # la o rezoluție efectivă mai mare — adică mai puțin „dreptunghi fantomă"
+        # rămas peste text. Compunerea finală se face oricum peste originalul
+        # full-res, doar sub mască, deci restul cadrului rămâne neatins.
+        roi = compute_roi(roi_raw, w, h)
+        if roi:
+            in_v = crop_to_roi(video_path, os.path.join(workdir, "roi_v.mp4"), roi)
+            in_m = crop_to_roi(mask_path, os.path.join(workdir, "roi_m.mp4"), roi, lossless=True)
+            iw, ih = roi[2], roi[3]
+        else:
+            in_v, in_m, iw, ih = video_path, mask_path, w, h
+
+        result_path = run_inpainting(in_v, in_m, workdir, duration,
+                                     max_img_size, quality, iw, ih, n_frames, fps)
 
         out_path = os.path.join(workdir, "final.mp4")
-        finalize(result_path, video_path, mask_path, out_path, w, h)
+        finalize(result_path, video_path, mask_path, out_path, w, h, roi=roi)
 
         out = deliver(out_path, job_input)
         out["detections"] = {
