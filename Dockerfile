@@ -28,6 +28,19 @@ FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 # orice driver din seria 12.x (>= 525), deci gardul de 12.8 e inutil de strict.
 ENV NVIDIA_REQUIRE_CUDA="cuda>=12.0"
 
+# Imaginile nvidia/cuda aduc bibliotecile de FORWARD COMPATIBILITY in
+# /usr/local/cuda/compat. nvidia-container-runtime le pune inaintea driverului
+# gazdei cand acesta e mai vechi decat CUDA din container. Dar forward compat
+# merge DOAR pe placi de datacenter (A100/H100/L40). Pe GeForce (RTX 4090/5090/
+# 3090) crapa cu:
+#   "Error 804: forward compatibility was attempted on non supported HW"
+# Containerul porneste, dar torch.cuda.is_available() da False, handler-ul refuza
+# sa mearga pe CPU si iese cu cod 1 -> RunPod il reporneste la ~17s la infinit pe
+# aceeasi masina, iar joburile stau in coada (41 de reporniri intr-o zi in loguri).
+# Fara compat, wheel-urile cu128 folosesc direct libcuda al gazdei prin CUDA minor
+# version compatibility, care merge pe orice driver din seria 12.x (>= 525).
+RUN rm -rf /usr/local/cuda/compat /usr/local/cuda-*/compat
+
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 

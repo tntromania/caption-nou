@@ -553,6 +553,61 @@ def run_detection(video_path, w, h, fps, n_frames, targets, extra_prompts):
 # ═════════════════════════════════════════════════════════════════════════════
 # MĂȘTI TEMPORALE
 # ═════════════════════════════════════════════════════════════════════════════
+# ── Plafonul de acoperire: strânge, nu arunca ────────────────────────────────
+# Vechiul comportament scotea din mască BOX-URILE CELE MAI MARI până cobora sub
+# plafon. Adică exact caption-ul cel mai vizibil rămânea întreg pe ecran — de
+# acolo venea „uneori nu acoperă toate cuvintele" (în loguri: zeci de cadre pe job).
+# Acum strângem TOATE casetele spre centru, treptat. Primii pași mănâncă doar
+# BOX_PAD-ul (context adăugat în jurul textului, nu text), deci în cazul obișnuit
+# — unde masca depășește plafonul cu puțin — textul rămâne acoperit complet.
+# Aruncatul rămâne doar ca ultimă soluție, când nici strâns la MASK_SHRINK_FLOOR
+# nu încape.
+MASK_SHRINK_FLOOR = float(os.environ.get("MASK_SHRINK_FLOOR", "0.55"))
+_SHRINK_STEPS = (0.92, 0.84, 0.76, 0.68, 0.60)
+
+
+def _shrink_box(b, frac):
+    """Strânge caseta spre centrul ei, la `frac` din fiecare latură."""
+    x1, y1, x2, y2 = b
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    hw, hh = (x2 - x1) * frac / 2.0, (y2 - y1) * frac / 2.0
+    nx1, ny1 = int(round(cx - hw)), int(round(cy - hh))
+    nx2, ny2 = int(round(cx + hw)), int(round(cy + hh))
+    return (max(0, nx1), max(0, ny1), max(nx1 + 1, nx2), max(ny1 + 1, ny2))
+
+
+def _fit_coverage(boxes, base_static, cap):
+    """Aduce masca sub plafon. Întoarce (casete, mască, cât s-a strâns).
+
+    Aria scade cu pătratul fracției (0.84 → 71% din arie), deci de obicei ajung
+    unul-doi pași ca să coborâm sub plafon fără să pierdem litere."""
+    def cover(bs):
+        m = base_static.copy()
+        for (x1, y1, x2, y2) in bs:
+            m[y1:y2, x1:x2] = 255
+        return m.mean() / 255.0, m
+
+    # 1.0 = casetele întregi: dacă apelantul ne cheamă și când masca deja încape,
+    # nu strângem degeaba
+    steps = [1.0] + [f for f in _SHRINK_STEPS if f >= MASK_SHRINK_FLOOR] + [MASK_SHRINK_FLOOR]
+    for frac in steps:
+        shrunk = [_shrink_box(b, frac) for b in boxes]
+        c, m = cover(shrunk)
+        if c <= cap:
+            return shrunk, m, frac
+    # nici strânse la maxim nu încap → abia acum scoatem cele mai mari
+    bs = sorted([_shrink_box(b, MASK_SHRINK_FLOOR) for b in boxes],
+                key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+    while bs:
+        c, m = cover(bs)
+        if c <= cap:
+            return bs, m, MASK_SHRINK_FLOOR
+        bs.pop()
+    _, m = cover(bs)
+    return bs, m, MASK_SHRINK_FLOOR
+
+
+
 def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf, kf_indices, workdir):
     """
     Scrie mask.mp4 (alb = de șters). Pentru fiecare frame:
@@ -595,6 +650,8 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
     ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     n_capped = 0
+    n_dropped = 0          # cadre unde nici strânse la maxim n-au încăput
+    n_shrunk_min = 1.0     # cea mai agresivă strângere aplicată
     # bounding box-ul UNIUNII tuturor măștilor, pe tot clipul: ProPainter n-are
     # de ce să macine cadrul întreg când textul stă într-o bandă. Se calculează
     # aici, după plafonare, ca să reflecte exact ce s-a desenat în mask.mp4.
@@ -606,18 +663,15 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
             for (x1, y1, x2, y2) in boxes:
                 mask[y1:y2, x1:x2] = 255
             # plasă de siguranță: dacă masca ar acoperi >MASK_MAX_COVERAGE din frame,
-            # inpainting-ul nu mai are din ce reconstrui → scoatem box-urile cele mai
-            # mari până coborâm sub plafon (mai bine rămâne puțin text decât video terci)
+            # inpainting-ul nu mai are din ce reconstrui. STRÂNGEM casetele spre
+            # centru în loc să le aruncăm — vezi _fit_coverage.
             if mask.mean() / 255.0 > MASK_MAX_COVERAGE:
                 n_capped += 1
-                boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))  # crescător după arie
-                while boxes:
-                    mask = base_static.copy()
-                    for (x1, y1, x2, y2) in boxes:
-                        mask[y1:y2, x1:x2] = 255
-                    if mask.mean() / 255.0 <= MASK_MAX_COVERAGE:
-                        break
-                    boxes.pop()  # scoate box-ul cel mai mare (ultimul)
+                boxes, mask, frac = _fit_coverage(boxes, base_static, MASK_MAX_COVERAGE)
+                if frac < 1.0:
+                    n_shrunk_min = min(n_shrunk_min, frac)
+                if not boxes:
+                    n_dropped += 1
             if mask.any():
                 total_active += 1
                 for (x1, y1, x2, y2) in ([b for b in boxes] + list(static_boxes)):
@@ -632,7 +686,10 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
         raise RuntimeError(f"Encodarea măștii a eșuat: {err[-300:]}")
 
     if n_capped:
-        print(f"[MASK] {n_capped} frame-uri plafonate la {MASK_MAX_COVERAGE:.0%} (box-urile cele mai mari scoase)", flush=True)
+        det = f"strânse până la {n_shrunk_min:.0%} din latură" if n_shrunk_min < 1.0 else "strânse"
+        if n_dropped:
+            det += f"; {n_dropped} au rămas fără casete (nici strânse nu încăpeau)"
+        print(f"[MASK] {n_capped} frame-uri plafonate la {MASK_MAX_COVERAGE:.0%} ({det})", flush=True)
     print(f"[MASK] {n_frames} frames, {total_active} cu mască activă → {mask_path}", flush=True)
     roi = (ux1, uy1, ux2, uy2) if ux2 > ux1 and uy2 > uy1 else None
     return total_active, roi
