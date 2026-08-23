@@ -652,6 +652,10 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
     n_capped = 0
     n_dropped = 0          # cadre unde nici strânse la maxim n-au încăput
     n_shrunk_min = 1.0     # cea mai agresivă strângere aplicată
+    # bbox-ul măștii PE FIECARE CADRU. Uniunea pe tot clipul aproape mereu iese
+    # cât tot cadrul (text sus într-o scenă, jos în alta) și decupajul nu se mai
+    # activa. Per bucată temporală banda e mult mai strânsă — vezi run_inpainting.
+    frame_boxes = []
     # bounding box-ul UNIUNII tuturor măștilor, pe tot clipul: ProPainter n-are
     # de ce să macine cadrul întreg când textul stă într-o bandă. Se calculează
     # aici, după plafonare, ca să reflecte exact ce s-a desenat în mask.mp4.
@@ -672,11 +676,18 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
                     n_shrunk_min = min(n_shrunk_min, frac)
                 if not boxes:
                     n_dropped += 1
+            fb = None
             if mask.any():
                 total_active += 1
-                for (x1, y1, x2, y2) in ([b for b in boxes] + list(static_boxes)):
+                bx1, by1, bx2, by2 = w, h, 0, 0
+                for (x1, y1, x2, y2) in (list(boxes) + list(static_boxes)):
                     ux1, uy1 = min(ux1, x1), min(uy1, y1)
                     ux2, uy2 = max(ux2, x2), max(uy2, y2)
+                    bx1, by1 = min(bx1, x1), min(by1, y1)
+                    bx2, by2 = max(bx2, x2), max(by2, y2)
+                if bx2 > bx1 and by2 > by1:
+                    fb = (bx1, by1, bx2, by2)
+            frame_boxes.append(fb)
             proc.stdin.write(mask.tobytes())
     finally:
         proc.stdin.close()
@@ -692,10 +703,10 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
         print(f"[MASK] {n_capped} frame-uri plafonate la {MASK_MAX_COVERAGE:.0%} ({det})", flush=True)
     print(f"[MASK] {n_frames} frames, {total_active} cu mască activă → {mask_path}", flush=True)
     roi = (ux1, uy1, ux2, uy2) if ux2 > ux1 and uy2 > uy1 else None
-    return total_active, roi
+    return total_active, roi, frame_boxes
 
 
-def compute_roi(roi, w, h):
+def compute_roi(roi, w, h, label=""):
     """Banda de inpainting: bbox-ul măștii + contur de context, aliniat la par.
 
     ProPainter are nevoie de pixeli SĂNĂTOȘI în jurul găurii ca să aibă din ce
@@ -715,9 +726,9 @@ def compute_roi(roi, w, h):
     if rw < 64 or rh < 64:
         return None
     if (rw * rh) / float(w * h) > ROI_MAX_AREA_PCT:
-        print(f"[ROI] banda acoperă {(rw*rh)/float(w*h):.0%} din cadru — nu decupez", flush=True)
+        print(f"[ROI]{label} banda acoperă {(rw*rh)/float(w*h):.0%} din cadru — nu decupez", flush=True)
         return None
-    print(f"[ROI] inpaint doar pe {rw}x{rh} @ ({x1},{y1}) = {(rw*rh)/float(w*h):.0%} din cadru "
+    print(f"[ROI]{label} inpaint doar pe {rw}x{rh} @ ({x1},{y1}) = {(rw*rh)/float(w*h):.0%} din cadru "
           f"(în loc de {w}x{h})", flush=True)
     return (x1, y1, rw, rh)
 
@@ -761,13 +772,19 @@ def _chunk_frames(pw, ph):
     return max(60, n)
 
 
-def _extract_segment(src, dst, start_frame, end_frame, lossless=False):
-    """Taie [start_frame, end_frame) din src. `trim` pe numere de cadre e exact
-    pe CFR (inputul e normalizat la CFR întreg la intrare)."""
+def _extract_segment(src, dst, start_frame, end_frame, lossless=False, roi=None):
+    """Taie [start_frame, end_frame) din src, opțional direct pe banda de text.
+    `trim` pe numere de cadre e exact pe CFR (inputul e normalizat la intrare).
+    Decupajul intră în ACELAȘI lanț de filtre: altfel am fi trecut de două ori
+    prin toate cadrele la rezoluție plină, doar ca să tăiem apoi marginile."""
+    vf = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS"
+    if roi:
+        x, y, rw, rh = roi
+        vf += f",crop={rw}:{rh}:{x}:{y}"
     subprocess.run([
         "ffmpeg", "-y", "-nostats", "-loglevel", "error",
         "-i", src,
-        "-vf", f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS",
+        "-vf", vf,
         "-an",
         *(["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0"] if lossless
           else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14"]),
@@ -795,32 +812,60 @@ def _concat_segments(seg_paths, drops, out_path, fps):
     subprocess.run(cmd, check=True)
 
 
-def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, quality, w, h, n_frames, fps):
-    """quality="fast" → doar ProPainter (~2 min pt 20s video, foarte bun pe captions).
-    quality="max"  → + rafinare DiffuEraser (calitate maximă, dar de 3-5x mai lent).
+def _pad_to_full(src, dst, roi, w, h):
+    """Banda inpaint-ată se scalează înapoi la mărimea ei și se așază la offsetul
+    din cadru. Restul rămâne negru, dar nu se vede niciodată: masca e 0 acolo prin
+    construcție (banda conține tot ce e mascat în cadrele bucății)."""
+    x, y, rw, rh = roi
+    subprocess.run([
+        "ffmpeg", "-y", "-nostats", "-loglevel", "error", "-i", src,
+        "-vf", f"scale={rw}:{rh}:flags=lanczos,pad={w}:{h}:{x}:{y},setsar=1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p", dst,
+    ], check=True)
+    return dst
 
-    Inpainting-ul rulează la _proc_size (independent de lungime); clipurile care
-    nu încap în VRAM se taie în bucăți temporale cu CHUNK_OVERLAP cadre de
-    suprapunere, procesate una câte una la rezoluție PLINĂ, apoi lipite.
-    finalize() pune rezultatul înapoi peste originalul full-res doar sub mască."""
+
+def _band_of(frame_boxes, s, e, w, h):
+    """Uniunea bbox-urilor măștii pe cadrele [s, e)."""
+    if not frame_boxes:
+        return None
+    x1, y1, x2, y2 = w, h, 0, 0
+    for fb in frame_boxes[s:e]:
+        if not fb:
+            continue
+        x1, y1 = min(x1, fb[0]), min(y1, fb[1])
+        x2, y2 = max(x2, fb[2]), max(y2, fb[3])
+    return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
+
+
+def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, quality,
+                   w, h, n_frames, fps, frame_boxes=None):
+    """quality="fast" -> doar ProPainter (~2 min pt 20s video, foarte bun pe captions).
+    quality="max"  -> + rafinare DiffuEraser (calitate maximă, dar de 3-5x mai lent).
+
+    Clipul se taie în bucăți temporale cu CHUNK_OVERLAP cadre de suprapunere.
+    FIECARE bucată își calculează BANDA ei de text și se inpaint-ează doar pe ea:
+    uniunea pe tot clipul ieșea 82-100% din cadru (text sus într-o scenă, jos în
+    alta) și decupajul nu se activa aproape niciodată. Per bucată banda e strânsă,
+    deci la același PROC_MAX_SIDE textul intră la o rezoluție efectivă mult mai
+    mare — de acolo veneau dreptunghiurile fantomă rămase peste text.
+    Bucata se așază înapoi în cadrul întreg înainte de lipire, ca toate să aibă
+    aceeași dimensiune. finalize() compune peste originalul full-res, doar sub mască."""
     priori_path = os.path.join(workdir, "priori.mp4")
     result_path = os.path.join(workdir, "diffueraser_out.mp4")
 
     def _attempt(max_side):
-        pw, ph = _proc_size(w, h, max_side)
-        chunk = _chunk_frames(pw, ph)
-        # dilatarea se dă lui ProPainter în pixeli DE PROCESARE, dar o exprimăm
-        # în pixeli la rezoluția originală → efectul rămâne același indiferent
-        # de scalare (înainte, 8px la 182x324 însemnau 32px pe video-ul real)
-        ratio = pw / float(w)
-        dil = max(1, int(round(MASK_DILATE_PX * ratio)))
+        # planul de bucăți se face pe cadrul ÎNTREG (conservator): banda fiecărei
+        # bucăți e mai mică sau egală, deci nu poate ieși din VRAM față de plan
+        fw, fh = _proc_size(w, h, max_side)
+        chunk = _chunk_frames(fw, fh)
         seg_dir = os.path.join(workdir, "segments")
         shutil.rmtree(seg_dir, ignore_errors=True)
         os.makedirs(seg_dir, exist_ok=True)
 
-        # resize_ratio=1.0 + width/height explicite → dezactivăm downscale-ul
-        # intern nedeterminist al DiffuEraser (default 0.6, ×0.5 peste 960px)
-        def _priori(vid, msk, dst, seg_frames):
+        def _priori(vid, msk, dst, seg_frames, pw, ph, dil):
+            # resize_ratio=1.0 + width/height explicite -> dezactivăm downscale-ul
+            # intern nedeterminist al DiffuEraser (default 0.6, x0.5 peste 960px)
             PROPAINTER.forward(
                 vid, msk, dst,
                 resize_ratio=1.0, width=pw, height=ph,
@@ -828,11 +873,6 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, qua
                 ref_stride=10, neighbor_length=10, subvideo_length=50,
                 mask_dilation=dil,
             )
-
-        if n_frames <= chunk:
-            print(f"[INPAINT] ProPainter @ {pw}x{ph} ({n_frames} cadre, dilate={dil}px)...", flush=True)
-            _priori(video_path, mask_path, priori_path, n_frames)
-            return
 
         # Bucata i PRODUCE cadrele [out_start, e) și le mai PROCESEAZĂ pe cele
         # `lead` dinaintea lor doar ca context temporal (se aruncă la lipire).
@@ -842,31 +882,44 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, qua
         out_start = 0
         while out_start < n_frames:
             lead = min(overlap, out_start)
-            s = out_start - lead
-            e = min(n_frames, s + chunk)
+            st = out_start - lead
+            e = min(n_frames, st + chunk)
             # coada scurtă se lipește de bucata curentă în loc să devină o bucată
             # separată: altfel ultima rulare ProPainter procesa `overlap`+2 cadre
             # ca să producă 1-2 utile — o trecere întreagă de GPU degeaba
             if 0 < n_frames - e <= overlap:
                 e = n_frames
-            plan.append((s, e, lead))
+            plan.append((st, e, lead))
             out_start = e
-        print(f"[INPAINT] ProPainter @ {pw}x{ph} ({n_frames} cadre, dilate={dil}px) "
-              f"→ {len(plan)} bucăți × max {chunk} cadre (overlap {overlap})", flush=True)
+        print(f"[INPAINT] {n_frames} cadre -> {len(plan)} bucăți x max {chunk} "
+              f"(overlap {overlap}), bandă proprie per bucată", flush=True)
 
         seg_outs, drops = [], []
-        for i, (s, e, lead) in enumerate(plan):
+        for i, (st, e, lead) in enumerate(plan):
+            tag = f" bucata {i+1}/{len(plan)}"
+            roi = compute_roi(_band_of(frame_boxes, st, e, w, h), w, h, label=tag)
+            bw, bh = (roi[2], roi[3]) if roi else (w, h)
+            pw, ph = _proc_size(bw, bh, max_side)
+            # dilatarea se dă lui ProPainter în pixeli DE PROCESARE, dar o exprimăm
+            # în pixeli la rezoluția originală -> efectul rămâne același indiferent
+            # de scalare (înainte, 8px la 182x324 însemnau 32px pe video-ul real)
+            dil = max(1, int(round(MASK_DILATE_PX * (pw / float(bw)))))
             seg_v = os.path.join(seg_dir, f"v{i:03d}.mp4")
             seg_m = os.path.join(seg_dir, f"m{i:03d}.mp4")
             seg_o = os.path.join(seg_dir, f"o{i:03d}.mp4")
-            _extract_segment(video_path, seg_v, s, e)
-            _extract_segment(mask_path, seg_m, s, e, lossless=True)
-            print(f"[INPAINT]   bucata {i+1}/{len(plan)}: cadre {s}-{e}", flush=True)
-            _priori(seg_v, seg_m, seg_o, e - s)
+            _extract_segment(video_path, seg_v, st, e, roi=roi)
+            _extract_segment(mask_path, seg_m, st, e, lossless=True, roi=roi)
+            print(f"[INPAINT] {tag}: cadre {st}-{e} @ {pw}x{ph} (dilate={dil}px)", flush=True)
+            _priori(seg_v, seg_m, seg_o, e - st, pw, ph, dil)
+            if roi:
+                seg_o = _pad_to_full(seg_o, os.path.join(seg_dir, f"p{i:03d}.mp4"), roi, w, h)
             seg_outs.append(seg_o)
             drops.append(lead)
-            os.remove(seg_v)
-            os.remove(seg_m)
+            for tmp in (seg_v, seg_m):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
             if DEVICE == "cuda":
                 torch.cuda.empty_cache()
             gc.collect()
@@ -879,23 +932,23 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, qua
         _attempt(PROC_MAX_SIDE)
     except torch.cuda.OutOfMemoryError:
         # NU reîncercăm aici: cât timp suntem în except, traceback-ul activ ține
-        # referințe la tensorii din ProPainter → empty_cache() nu poate elibera
+        # referințe la tensorii din ProPainter -> empty_cache() nu poate elibera
         # VRAM-ul și retry-ul murea tot cu OOM ("22.5 GiB in use" la reîncercare)
         oom = True
     if oom:
         gc.collect()
         torch.cuda.empty_cache()
         retry_side = max(MIN_PROC_SIDE, int(PROC_MAX_SIDE * 0.7))
-        print(f"[INPAINT] CUDA OOM → reîncerc cu latura lungă {retry_side}", flush=True)
+        print(f"[INPAINT] CUDA OOM -> reîncerc cu latura lungă {retry_side}", flush=True)
         _attempt(retry_side)
 
     if quality != "max":
-        print("[INPAINT] quality=fast → sar peste DiffuEraser", flush=True)
+        print("[INPAINT] quality=fast -> sar peste DiffuEraser", flush=True)
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
         return priori_path
 
-    # DiffuEraser rulează la max_img_size, nu la _proc_size → dilatarea lui se
+    # DiffuEraser rulează la max_img_size, nu la _proc_size -> dilatarea lui se
     # convertește la ACEA scară, tot din MASK_DILATE_PX (pixeli la full res)
     diffu_ratio = min(1.0, max_img_size / float(max(w, h)))
     diffu_dil = max(1, int(round(MASK_DILATE_PX * diffu_ratio)))
@@ -1123,27 +1176,23 @@ def handler(job):
         gc.collect()
 
         mask_path = os.path.join(workdir, "mask.mp4")
-        _total_active, roi_raw = build_mask_video(mask_path, w, h, fps, n_frames,
-                                                  static_boxes, dynamic_by_kf, kf_indices, workdir)
+        _total_active, _roi_all, frame_boxes = build_mask_video(mask_path, w, h, fps, n_frames,
+                                                                 static_boxes, dynamic_by_kf, kf_indices, workdir)
 
-        # Inpainting DOAR pe banda de text. Câștigul e dublu: mai puțini pixeli
-        # de măcinat (deci mai ieftin) și, la același PROC_MAX_SIDE, banda intră
-        # la o rezoluție efectivă mai mare — adică mai puțin „dreptunghi fantomă"
-        # rămas peste text. Compunerea finală se face oricum peste originalul
-        # full-res, doar sub mască, deci restul cadrului rămâne neatins.
-        roi = compute_roi(roi_raw, w, h)
-        if roi:
-            in_v = crop_to_roi(video_path, os.path.join(workdir, "roi_v.mp4"), roi)
-            in_m = crop_to_roi(mask_path, os.path.join(workdir, "roi_m.mp4"), roi, lossless=True)
-            iw, ih = roi[2], roi[3]
-        else:
-            in_v, in_m, iw, ih = video_path, mask_path, w, h
-
-        result_path = run_inpainting(in_v, in_m, workdir, duration,
-                                     max_img_size, quality, iw, ih, n_frames, fps)
+        # Inpainting DOAR pe banda de text, calculata PER BUCATA temporala.
+        # Uniunea pe tot clipul iesea 82-100% din cadru (text sus intr-o scena, jos
+        # in alta) si decupajul nu se activa aproape niciodata. Per bucata banda e
+        # stransa, deci la acelasi PROC_MAX_SIDE textul intra la rezolutie efectiva
+        # mult mai mare. Compunerea finala se face oricum peste originalul full-res,
+        # doar sub masca, deci restul cadrului ramane neatins.
+        result_path = run_inpainting(video_path, mask_path, workdir, duration,
+                                     max_img_size, quality, w, h, n_frames, fps,
+                                     frame_boxes=frame_boxes)
 
         out_path = os.path.join(workdir, "final.mp4")
-        finalize(result_path, video_path, mask_path, out_path, w, h, roi=roi)
+        # rezultatul vine deja la cadru intreg (fiecare bucata s-a asezat inapoi
+        # la offsetul benzii ei), deci aici nu mai e nimic de repozitionat
+        finalize(result_path, video_path, mask_path, out_path, w, h, roi=None)
 
         out = deliver(out_path, job_input)
         out["detections"] = {
