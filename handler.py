@@ -792,10 +792,17 @@ def _extract_segment(src, dst, start_frame, end_frame, lossless=False, roi=None)
     ], check=True)
 
 
-def _concat_segments(seg_paths, drops, out_path, fps):
+def _concat_segments(seg_paths, drops, out_path, fps, places=None, w=None, h=None):
     """Lipește bucățile aruncând primele `drops[i]` cadre din fiecare (cadrele de
-    suprapunere, deja acoperite de bucata anterioară). Un singur re-encode."""
-    if len(seg_paths) == 1 and drops[0] == 0:
+    suprapunere, deja acoperite de bucata anterioară). Un singur re-encode.
+
+    `places[i]` = banda pe care a fost inpaint-ată bucata i (sau None dacă a mers
+    pe cadru întreg). Aducerea la dimensiune comună se face AICI, în același lanț
+    de filtre: `concat` refuză intrări de mărimi diferite, iar o trecere separată
+    per bucată însemna încă o codare full-res de fiecare dată — pe un clip de 33s
+    se simțea în timpul total."""
+    same_size = not places or all(p is None for p in places)
+    if len(seg_paths) == 1 and drops[0] == 0 and same_size:
         shutil.move(seg_paths[0], out_path)
         return
     cmd = ["ffmpeg", "-y", "-nostats", "-loglevel", "error"]
@@ -803,36 +810,22 @@ def _concat_segments(seg_paths, drops, out_path, fps):
         cmd += ["-i", p]
     parts, labels = [], []
     for i, d in enumerate(drops):
-        parts.append(f"[{i}:v]trim=start_frame={d},setpts=PTS-STARTPTS[v{i}]")
+        chain = f"[{i}:v]trim=start_frame={d},setpts=PTS-STARTPTS"
+        if not same_size:
+            roi = places[i] if places else None
+            if roi:
+                rx, ry, rw, rh = roi
+                chain += f",scale={rw}:{rh}:flags=lanczos,pad={w}:{h}:{rx}:{ry}"
+            else:
+                chain += f",scale={w}:{h}:flags=lanczos"
+            chain += ",setsar=1"
+        parts.append(chain + f"[v{i}]")
         labels.append(f"[v{i}]")
     parts.append("".join(labels) + f"concat=n={len(seg_paths)}:v=1:a=0[out]")
     cmd += ["-filter_complex", ";".join(parts), "-map", "[out]",
             "-r", f"{fps}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "14",
             "-pix_fmt", "yuv420p", out_path]
     subprocess.run(cmd, check=True)
-
-
-def _to_full_frame(src, dst, roi, w, h):
-    """Aduce rezultatul unei bucăți la CADRUL ÎNTREG. Obligatoriu pentru toate
-    bucățile, nu doar pentru cele decupate: `concat` refuză intrări de dimensiuni
-    diferite, iar bucata decupată se întorcea la wxh în timp ce una nedecupată
-    rămânea la rezoluția de procesare (360x640 vs 720x1280 → "Input link
-    parameters do not match", jobul pica la lipire).
-
-    Cu bandă: se scalează la mărimea benzii și se așază la offsetul ei; restul
-    cadrului rămâne negru, dar nu se vede niciodată — masca e 0 acolo prin
-    construcție (banda conține tot ce e mascat în cadrele bucății)."""
-    if roi:
-        x, y, rw, rh = roi
-        vf = f"scale={rw}:{rh}:flags=lanczos,pad={w}:{h}:{x}:{y},setsar=1"
-    else:
-        vf = f"scale={w}:{h}:flags=lanczos,setsar=1"
-    subprocess.run([
-        "ffmpeg", "-y", "-nostats", "-loglevel", "error", "-i", src,
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p", dst,
-    ], check=True)
-    return dst
 
 
 def _band_of(frame_boxes, s, e, w, h):
@@ -904,7 +897,7 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, qua
         print(f"[INPAINT] {n_frames} cadre -> {len(plan)} bucăți x max {chunk} "
               f"(overlap {overlap}), bandă proprie per bucată", flush=True)
 
-        seg_outs, drops = [], []
+        seg_outs, drops, places = [], [], []
         for i, (st, e, lead) in enumerate(plan):
             tag = f" bucata {i+1}/{len(plan)}"
             roi = compute_roi(_band_of(frame_boxes, st, e, w, h), w, h, label=tag)
@@ -921,10 +914,9 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, qua
             _extract_segment(mask_path, seg_m, st, e, lossless=True, roi=roi)
             print(f"[INPAINT] {tag}: cadre {st}-{e} @ {pw}x{ph} (dilate={dil}px)", flush=True)
             _priori(seg_v, seg_m, seg_o, e - st, pw, ph, dil)
-            # TOATE bucățile ajung la cadru întreg, altfel concat-ul de la final pică
-            seg_o = _to_full_frame(seg_o, os.path.join(seg_dir, f"p{i:03d}.mp4"), roi, w, h)
             seg_outs.append(seg_o)
             drops.append(lead)
+            places.append(roi)
             for tmp in (seg_v, seg_m):
                 try:
                     os.remove(tmp)
@@ -934,7 +926,7 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, qua
                 torch.cuda.empty_cache()
             gc.collect()
 
-        _concat_segments(seg_outs, drops, priori_path, fps)
+        _concat_segments(seg_outs, drops, priori_path, fps, places=places, w=w, h=h)
         shutil.rmtree(seg_dir, ignore_errors=True)
 
     oom = False
