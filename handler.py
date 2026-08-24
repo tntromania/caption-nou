@@ -812,14 +812,24 @@ def _concat_segments(seg_paths, drops, out_path, fps):
     subprocess.run(cmd, check=True)
 
 
-def _pad_to_full(src, dst, roi, w, h):
-    """Banda inpaint-ată se scalează înapoi la mărimea ei și se așază la offsetul
-    din cadru. Restul rămâne negru, dar nu se vede niciodată: masca e 0 acolo prin
+def _to_full_frame(src, dst, roi, w, h):
+    """Aduce rezultatul unei bucăți la CADRUL ÎNTREG. Obligatoriu pentru toate
+    bucățile, nu doar pentru cele decupate: `concat` refuză intrări de dimensiuni
+    diferite, iar bucata decupată se întorcea la wxh în timp ce una nedecupată
+    rămânea la rezoluția de procesare (360x640 vs 720x1280 → "Input link
+    parameters do not match", jobul pica la lipire).
+
+    Cu bandă: se scalează la mărimea benzii și se așază la offsetul ei; restul
+    cadrului rămâne negru, dar nu se vede niciodată — masca e 0 acolo prin
     construcție (banda conține tot ce e mascat în cadrele bucății)."""
-    x, y, rw, rh = roi
+    if roi:
+        x, y, rw, rh = roi
+        vf = f"scale={rw}:{rh}:flags=lanczos,pad={w}:{h}:{x}:{y},setsar=1"
+    else:
+        vf = f"scale={w}:{h}:flags=lanczos,setsar=1"
     subprocess.run([
         "ffmpeg", "-y", "-nostats", "-loglevel", "error", "-i", src,
-        "-vf", f"scale={rw}:{rh}:flags=lanczos,pad={w}:{h}:{x}:{y},setsar=1",
+        "-vf", vf,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p", dst,
     ], check=True)
     return dst
@@ -911,8 +921,8 @@ def run_inpainting(video_path, mask_path, workdir, duration_s, max_img_size, qua
             _extract_segment(mask_path, seg_m, st, e, lossless=True, roi=roi)
             print(f"[INPAINT] {tag}: cadre {st}-{e} @ {pw}x{ph} (dilate={dil}px)", flush=True)
             _priori(seg_v, seg_m, seg_o, e - st, pw, ph, dil)
-            if roi:
-                seg_o = _pad_to_full(seg_o, os.path.join(seg_dir, f"p{i:03d}.mp4"), roi, w, h)
+            # TOATE bucățile ajung la cadru întreg, altfel concat-ul de la final pică
+            seg_o = _to_full_frame(seg_o, os.path.join(seg_dir, f"p{i:03d}.mp4"), roi, w, h)
             seg_outs.append(seg_o)
             drops.append(lead)
             for tmp in (seg_v, seg_m):
