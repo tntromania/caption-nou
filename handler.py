@@ -104,6 +104,7 @@ STATIC_RATIO     = float(os.environ.get("STATIC_RATIO", "0.60"))     # % din key
 MAX_BOX_AREA_PCT = float(os.environ.get("MAX_BOX_AREA_PCT", "0.25")) # ignoră box-uri > 25% din frame
 BOX_PAD          = int(os.environ.get("BOX_PAD", "6"))
 DRIFT_MAX_PCT    = float(os.environ.get("DRIFT_MAX_PCT", "0.04"))    # drift max al unui cluster (fracție din diagonală) ca să fie overlay, nu text pe obiect
+DRIFT_TRIM       = float(os.environ.get("DRIFT_TRIM", "0.10"))       # cozile ignorate la măsurarea driftului (0 = max-min, ca înainte)
 MASK_MAX_COVERAGE = float(os.environ.get("MASK_MAX_COVERAGE", "0.25")) # plafonul măștii pe un frame — peste, scoatem box-urile cele mai mari
                                                                        # (0.40 lăsa inpainting-ul fără sursă: 40% din cadru șters = terci)
 
@@ -413,9 +414,22 @@ def _anchor_drift(members):
     lățimea; în funcție de aliniere rămâne fixă marginea stângă / centrul / dreapta.
     Luăm deci pe fiecare axă MINIMUL intervalului de variație dintre cele 3 ancore
     (min / centru / max) — dacă și cea mai stabilă ancoră se plimbă mult, textul e
-    lipit de un obiect din scenă (tricou, produs, mașină), nu de ecran."""
+    lipit de un obiect din scenă (tricou, produs, mașină), nu de ecran.
+
+    Intervalul se măsoară TĂIND cozile (DRIFT_TRIM), nu cu max-min: EasyOCR mai
+    întoarce din când în când doar o bucată din frază („envelope" în loc de „on
+    an envelope"), iar centrul bucății sare cu sute de px. Cu max-min, 3 citiri
+    trunchiate din 53 făceau un caption fix ca un ceas (mediană 542px, MAD 1px)
+    să pară că traversează 217px din cadru — clusterul era aruncat întreg și
+    subtitrarea rămânea arsă în video. Un obiect care chiar se mișcă prin scenă
+    derivă pe MAJORITATEA cadrelor, deci trece în continuare de prag."""
     def spread(vals):
-        return max(vals) - min(vals)
+        if DRIFT_TRIM <= 0 or len(vals) < 5:
+            return max(vals) - min(vals)
+        s = sorted(vals)
+        lo = s[int(round((len(s) - 1) * DRIFT_TRIM))]
+        hi = s[int(round((len(s) - 1) * (1.0 - DRIFT_TRIM)))]
+        return hi - lo
     xs1 = [b[0] for _, b in members]; xs2 = [b[2] for _, b in members]
     ys1 = [b[1] for _, b in members]; ys2 = [b[3] for _, b in members]
     cxs = [(a + b) / 2 for a, b in zip(xs1, xs2)]
