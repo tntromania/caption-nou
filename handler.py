@@ -38,6 +38,7 @@ import time
 import traceback
 
 import gc
+import math
 
 _T_BOOT = time.time()
 
@@ -103,10 +104,25 @@ OCR_CONF         = float(os.environ.get("OCR_CONF", "0.25"))
 STATIC_RATIO     = float(os.environ.get("STATIC_RATIO", "0.60"))     # % din keyframes ca un box să fie "static"
 MAX_BOX_AREA_PCT = float(os.environ.get("MAX_BOX_AREA_PCT", "0.25")) # ignoră box-uri > 25% din frame
 BOX_PAD          = int(os.environ.get("BOX_PAD", "6"))
-DRIFT_MAX_PCT    = float(os.environ.get("DRIFT_MAX_PCT", "0.04"))    # drift max al unui cluster (fracție din diagonală) ca să fie overlay, nu text pe obiect
-DRIFT_TRIM       = float(os.environ.get("DRIFT_TRIM", "0.10"))       # cozile ignorate la măsurarea driftului (0 = max-min, ca înainte)
-MASK_MAX_COVERAGE = float(os.environ.get("MASK_MAX_COVERAGE", "0.25")) # plafonul măștii pe un frame — peste, scoatem box-urile cele mai mari
+DRIFT_MAX_PCT    = float(os.environ.get("DRIFT_MAX_PCT", "0.04"))    # cât poate varia poziția unui cluster (fracție din diagonală) ca să fie ștanțat STATIC pe tot clipul
+DRIFT_TRIM       = float(os.environ.get("DRIFT_TRIM", "0.10"))       # cozile ignorate la măsurarea variației (0 = max-min, ca înainte)
+DRIFT_STEP_PCT   = float(os.environ.get("DRIFT_STEP_PCT", "0.012"))  # cât se poate mișca ACELAȘI text între două keyframe-uri (fracție din diagonală) ca să nu fie text pe obiect
+SAME_TEXT_TOL    = float(os.environ.get("SAME_TEXT_TOL", "0.12"))    # două box-uri cu lățime/înălțime la ±12% = același text (pt măsurarea mișcării)
+MASK_MAX_COVERAGE = float(os.environ.get("MASK_MAX_COVERAGE", "0.25")) # plafonul măștii pe un frame — peste, se sacrifică întâi ce NU e caption
                                                                        # (0.40 lăsa inpainting-ul fără sursă: 40% din cadru șters = terci)
+# ── Ce acceptăm din OCR ca text de șters ─────────────────────────────────────
+# EasyOCR taie o linie de caption în bucăți și dă fiecăreia încrederea de
+# RECUNOAȘTERE. Pentru ștergere contează doar UNDE e textul, nu dacă l-a citit
+# corect: pe fonturile de caption (bold + contur + umbră) cuvinte întregi ies cu
+# conf 0.05-0.20 („just" din „Lee, just one inch", „…up, driving") și erau
+# aruncate → rămâneau arse în mijlocul liniei. O bucată slabă se acceptă acum
+# dacă stă pe ACEEAȘI LINIE cu text sigur (sau e rândul de deasupra/dedesubt al
+# aceluiași caption), ori dacă în ±WEAK_TEMPORAL_KF keyframe-uri s-a citit text
+# sigur exact pe linia aceea.
+HORIZ_DEG        = float(os.environ.get("HORIZ_DEG", "10"))         # sub atâtea grade = linie orizontală (caption); peste = text rotit
+LINE_GAP         = float(os.environ.get("LINE_GAP", "1.2"))         # distanța max între bucățile aceleiași linii (× înălțimea textului)
+LINE_H_RATIO     = float(os.environ.get("LINE_H_RATIO", "2.2"))     # raportul max de înălțime între bucățile aceleiași linii
+WEAK_TEMPORAL_KF = int(os.environ.get("WEAK_TEMPORAL_KF", "2"))     # câte keyframe-uri înainte/după caută sprijin temporal o bucată slabă
 
 sys.path.insert(0, DIFFUERASER_DIR)
 
@@ -325,11 +341,67 @@ def _has_cjk(text):
     return bool(_CJK_RE.search(text))
 
 
+class TextBox(tuple):
+    """(x1, y1, x2, y2) — pe dreptunghi merge toată logica (IoU, clustere, ROI) —
+    plus ce trebuie ca masca să fie desenată corect:
+      poly  — patrulaterul REAL al textului, cu padding (None = chiar dreptunghiul)
+      core  — același contur FĂRĂ padding: glifele propriu-zise, sub care
+              plafonul de acoperire nu are voie să strângă
+      horiz — linie orizontală de text (caption), nu text rotit
+    Textul rotit (watermark diagonal „BAYOAR FILM" care se plimbă prin cadru) are
+    dreptunghiul încadrator de 3-4× mai mare decât textul: ștampilat ca dreptunghi
+    rodea jumătate de personaj și umplea singur plafonul de 25%."""
+    poly = None
+    core = None
+    horiz = False
+
+
+def _textbox(rect, poly=None, core=None, horiz=False):
+    tb = TextBox(tuple(int(v) for v in rect))
+    tb.poly, tb.core, tb.horiz = poly, core, horiz
+    return tb
+
+
+def _draw_box(mask, b):
+    """Desenează un box în mască — poligonul real dacă există, altfel dreptunghiul."""
+    poly = getattr(b, "poly", None)
+    if poly is not None:
+        cv2.fillPoly(mask, [np.round(poly).astype(np.int32)], 255)
+    else:
+        x1, y1, x2, y2 = b[:4]
+        mask[y1:y2, x1:x2] = 255
+
+
+def _is_caption_line(b):
+    return bool(getattr(b, "horiz", False)) and getattr(b, "core", None) is not None
+
+
+def _box_area(b):
+    return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+
+
+def _quad_info(quad, strong):
+    """Patrulaterul EasyOCR (TL, TR, BR, BL) → geometria de care avem nevoie."""
+    p = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    u = p[1] - p[0]
+    L = float(np.hypot(u[0], u[1])) or 1.0
+    v = p[3] - p[0]
+    H = float(np.hypot(v[0], v[1])) or 1.0
+    ang = math.degrees(math.atan2(float(u[1]), float(u[0])))
+    x1, y1 = p.min(axis=0)
+    x2, y2 = p.max(axis=0)
+    return {"p": p, "u": u / L, "v": v / H, "L": L, "H": H,
+            "rect": (float(x1), float(y1), float(x2), float(y2)),
+            "horiz": abs(ang) <= HORIZ_DEG, "strong": strong}
+
+
 def detect_text_ocr(frame_bgr, w, h):
-    """EasyOCR pe un frame → listă de box-uri (x1,y1,x2,y2). Downscale pt viteză.
-    Rulează AMBELE cititoare: latin cu prag de conf normal; din cel chinezesc se
-    păstrează doar box-urile cu ideograme, FĂRĂ prag de conf — ch_sim raportează
-    conf ~0 chiar la citiri corecte, iar pt ștergere contează regiunea, nu textul."""
+    """EasyOCR pe un frame → bucăți BRUTE de text (patrulater în px originali +
+    dacă e „sigură"). Downscale pt viteză. Rulează AMBELE cititoare: latin cu
+    prag de conf; din cel chinezesc doar box-urile cu ideograme, FĂRĂ prag —
+    ch_sim raportează conf ~0 chiar la citiri corecte.
+    Bucățile latine slabe NU se mai aruncă aici: _text_boxes_from_hits decide,
+    cu tot clipul în față, care dintre ele sunt tot text de caption."""
     scale = 1.0
     img = frame_bgr
     if w > 1280:
@@ -339,29 +411,132 @@ def detect_text_ocr(frame_bgr, w, h):
 
     hits = []
     for (bbox, text, conf) in get_ocr().readtext(rgb, detail=1):
-        if conf >= OCR_CONF and str(text).strip():
-            hits.append(bbox)
+        strong = conf >= OCR_CONF and bool(str(text).strip())
+        hits.append(_quad_info(np.array(bbox, dtype=np.float32) / scale, strong))
     for (bbox, text, conf) in get_ocr_zh().readtext(rgb, detail=1):
         if _has_cjk(str(text)):
-            hits.append(bbox)
+            hits.append(_quad_info(np.array(bbox, dtype=np.float32) / scale, True))
+    return hits
+
+
+def _same_line(a, b):
+    """Două dreptunghiuri de text pe ACEEAȘI linie (bucăți ale aceleiași fraze)."""
+    ha, hb = a[3] - a[1], b[3] - b[1]
+    if min(ha, hb) <= 0 or max(ha, hb) > LINE_H_RATIO * min(ha, hb):
+        return False
+    if min(a[3], b[3]) - max(a[1], b[1]) < 0.5 * min(ha, hb):
+        return False
+    gap = max(0.0, b[0] - a[2], a[0] - b[2])
+    return gap <= LINE_GAP * max(ha, hb)
+
+
+def _stacked(a, b):
+    """b e rândul de deasupra/dedesubt al aceluiași bloc de caption ca a."""
+    ha, hb = a[3] - a[1], b[3] - b[1]
+    wa, wb = a[2] - a[0], b[2] - b[0]
+    if min(ha, hb) <= 0 or max(ha, hb) > 1.8 * min(ha, hb):
+        return False
+    if min(a[2], b[2]) - max(a[0], b[0]) < 0.3 * min(wa, wb):
+        return False
+    return max(0.0, b[1] - a[3], a[1] - b[3]) <= 0.6 * max(ha, hb)
+
+
+def _same_place(a, b):
+    """Aceeași linie, în același loc (pt sprijin temporal: ±1s înainte/după)."""
+    ha, hb = a[3] - a[1], b[3] - b[1]
+    if min(ha, hb) <= 0 or max(ha, hb) > LINE_H_RATIO * min(ha, hb):
+        return False
+    return (min(a[3], b[3]) - max(a[1], b[1]) >= 0.5 * min(ha, hb)
+            and min(a[2], b[2]) - max(a[0], b[0]) > 0)
+
+
+def _boxes_from_accepted(hits, w, h):
+    """Bucățile acceptate ale unui keyframe → TextBox-uri cu padding.
+    Bucățile de pe aceeași linie se LIPESC într-un singur box: fără goluri între
+    cuvinte, iar clusterele văd linia întreagă, nu jumătăți care „se plimbă"."""
+    lines = [list(hh["rect"]) + [hh["H"]] for hh in hits if hh["horiz"]]
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(lines)):
+            for j in range(i + 1, len(lines)):
+                a, b = lines[i], lines[j]
+                if _same_line(a, b):
+                    lines[i] = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]), max(a[4], b[4])]
+                    del lines[j]
+                    merged = True
+                    break
+            if merged:
+                break
 
     boxes = []
-    for bbox in hits:
-        pts = np.array(bbox, dtype=np.float32) / scale
-        x, y, bw, bh = cv2.boundingRect(pts.astype(np.int32))
+    frame_area = float(w * h)
+    for x1, y1, x2, y2, H in lines:
         # un „text" mai mare de 25% din frame = fals pozitiv OCR (aceeași regulă ca la Florence)
-        if bw * bh > w * h * MAX_BOX_AREA_PCT:
+        if (x2 - x1) * (y2 - y1) > frame_area * MAX_BOX_AREA_PCT:
             continue
-        # Padding PROPORȚIONAL cu înălțimea textului (nu 6px fix): box-urile EasyOCR
-        # sunt strânse fix pe glife, iar prima/ultima literă ies adesea în afara lor
-        # (fonturi mari, litere cu diacritice/descendente, pop-in animat între
-        # keyframes) → rămâneau arse în video. Orizontal ~o lățime de literă.
-        pad_x = max(BOX_PAD, int(round(bh * 0.55)))
-        pad_y = max(BOX_PAD, int(round(bh * 0.30)))
-        b = _clamp_box(x, y, x + bw, y + bh, w, h, pad_x=pad_x, pad_y=pad_y)
+        # Padding PROPORȚIONAL cu înălțimea textului: box-urile EasyOCR sunt strânse
+        # pe glife, iar prima/ultima literă, conturul și umbra ies în afara lor.
+        pad_x = max(BOX_PAD, int(round(H * 0.55)))
+        pad_y = max(BOX_PAD, int(round(H * 0.30)))
+        b = _clamp_box(x1, y1, x2, y2, w, h, pad_x=pad_x, pad_y=pad_y)
+        core = _clamp_box(x1, y1, x2, y2, w, h, pad=0)
+        if b and core:
+            boxes.append(_textbox(b, core=core, horiz=True))
+
+    for hh in hits:
+        if hh["horiz"]:
+            continue
+        # text rotit: padding pe axele LUI (lungime/înălțime), desenat ca poligon.
+        # Paddingul vine din înălțimea reală a textului, nu din dreptunghiul
+        # încadrator (la -20° acela e de 3-4× mai înalt → padding de sute de px).
+        if hh["L"] * hh["H"] > frame_area * MAX_BOX_AREA_PCT:
+            continue
+        p, u, v = hh["p"], hh["u"], hh["v"]
+        px = max(BOX_PAD, hh["H"] * 0.55)
+        py = max(BOX_PAD, hh["H"] * 0.30)
+        poly = np.array([p[0] - u * px - v * py, p[1] + u * px - v * py,
+                         p[2] + u * px + v * py, p[3] - u * px + v * py], dtype=np.float32)
+        b = _clamp_box(poly[:, 0].min(), poly[:, 1].min(), poly[:, 0].max(), poly[:, 1].max(), w, h, pad=0)
         if b:
-            boxes.append(b)
+            boxes.append(_textbox(b, poly=poly, core=p.copy(), horiz=False))
     return boxes
+
+
+def _text_boxes_from_hits(raw_by_kf, w, h):
+    """Bucățile brute de pe toate keyframe-urile → {kf: [TextBox]}.
+    Aici se decide ce bucăți slabe sunt tot caption (vezi WEAK_TEMPORAL_KF)."""
+    kfs = sorted(raw_by_kf)
+    strong_lines = {k: [hh["rect"] for hh in raw_by_kf[k] if hh["strong"] and hh["horiz"]] for k in kfs}
+    out, n_weak = {}, 0
+    for i, k in enumerate(kfs):
+        acc = [hh for hh in raw_by_kf[k] if hh["strong"]]
+        weak = [hh for hh in raw_by_kf[k] if not hh["strong"] and hh["horiz"]]
+        near = []
+        for j in range(max(0, i - WEAK_TEMPORAL_KF), min(len(kfs), i + WEAK_TEMPORAL_KF + 1)):
+            if j != i:
+                near += strong_lines[kfs[j]]
+        # în lanț: o bucată acceptată poate sprijini la rândul ei una vecină
+        changed = True
+        while changed and weak:
+            changed = False
+            still = []
+            for hh in weak:
+                r = hh["rect"]
+                ok = any(a["horiz"] and (_same_line(a["rect"], r) or _stacked(a["rect"], r)) for a in acc)
+                if not ok:
+                    ok = any(_same_place(s, r) for s in near)
+                if ok:
+                    acc.append(hh)
+                    n_weak += 1
+                    changed = True
+                else:
+                    still.append(hh)
+            weak = still
+        out[k] = _boxes_from_accepted(acc, w, h)
+    if n_weak:
+        print(f"[DETECT] +{n_weak} bucăți de text citite nesigur, păstrate (pe linie cu text sigur / în același loc ±{WEAK_TEMPORAL_KF} kf)", flush=True)
+    return out
 
 
 @torch.inference_mode()
@@ -430,13 +605,65 @@ def _anchor_drift(members):
         lo = s[int(round((len(s) - 1) * DRIFT_TRIM))]
         hi = s[int(round((len(s) - 1) * (1.0 - DRIFT_TRIM)))]
         return hi - lo
+    dx, dy = _anchor_spread(members, spread)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _anchor_spread(members, spread):
+    """(dx, dy) — variația celei mai stabile ancore pe fiecare axă."""
     xs1 = [b[0] for _, b in members]; xs2 = [b[2] for _, b in members]
     ys1 = [b[1] for _, b in members]; ys2 = [b[3] for _, b in members]
     cxs = [(a + b) / 2 for a, b in zip(xs1, xs2)]
     cys = [(a + b) / 2 for a, b in zip(ys1, ys2)]
     dx = min(spread(xs1), spread(cxs), spread(xs2))
     dy = min(spread(ys1), spread(cys), spread(ys2))
-    return (dx * dx + dy * dy) ** 0.5
+    return dx, dy
+
+
+def _vertical_drift(members):
+    """Variația pe VERTICALĂ a clusterului (px), cozi tăiate ca la _anchor_drift.
+    O citire OCR parțială taie din LĂȚIMEA liniei, niciodată din înălțime — deci
+    pe verticală un caption ars stă pe loc oricât de ciuntit ar fi citit, pe când
+    un tricou/obiect filmat apare la înălțimi diferite de la o scenă la alta."""
+    def spread(vals):
+        if DRIFT_TRIM <= 0 or len(vals) < 5:
+            return max(vals) - min(vals)
+        s = sorted(vals)
+        return s[int(round((len(s) - 1) * (1.0 - DRIFT_TRIM)))] - s[int(round((len(s) - 1) * DRIFT_TRIM))]
+    return _anchor_spread(members, spread)[1]
+
+
+def _motion_drift(members, max_gap):
+    """Cât se MIȘCĂ textul cât timp rămâne ACELAȘI text (px între keyframe-uri
+    vecine). Se compară doar box-uri de mărime aproape egală (±SAME_TEXT_TOL) de
+    pe keyframe-uri consecutive: un caption ars stă nemișcat cât e afișat, apoi
+    SARE (altă frază, altă lățime) — săriturile nu contează; textul de pe un
+    tricou/produs filmat se deplasează continuu păstrându-și mărimea.
+    Se ia mediana de jos: câteva perechi strâmbe (citiri parțiale de mărime
+    apropiată) nu pot face singure un caption să pară în mișcare."""
+    by_fi = {}
+    for fi, b in members:
+        by_fi.setdefault(fi, []).append(b)
+    fis = sorted(by_fi)
+    moves = []
+    for a, c in zip(fis, fis[1:]):
+        if c - a > max_gap:
+            continue
+        for ba in by_fi[a]:
+            wa, ha = ba[2] - ba[0], ba[3] - ba[1]
+            best = None
+            for bc in by_fi[c]:
+                wc, hc = bc[2] - bc[0], bc[3] - bc[1]
+                if abs(wa - wc) > SAME_TEXT_TOL * max(wa, wc) or abs(ha - hc) > SAME_TEXT_TOL * max(ha, hc):
+                    continue
+                d = math.hypot((ba[0] + ba[2] - bc[0] - bc[2]) / 2.0, (ba[1] + ba[3] - bc[1] - bc[3]) / 2.0)
+                best = d if best is None else min(best, d)
+            if best is not None:
+                moves.append(best)
+    if len(moves) < 2:
+        return 0.0
+    moves.sort()
+    return moves[(len(moves) - 1) // 2]
 
 
 def group_static_boxes(per_frame_boxes, min_ratio, n_frames_detected, frame_diag=None):
@@ -445,11 +672,21 @@ def group_static_boxes(per_frame_boxes, min_ratio, n_frames_detected, frame_diag
     Returnează (static_boxes, per_frame_dynamic).
 
     Anti-distrugere (fix „video terci pe RedNote"):
-      • clusterele care DERIVEAZĂ prin cadru (text pe haine/obiecte filmate) se
-        ARUNCĂ — nu-s overlay ars, iar inpainting-ul lor tocă subiectul video;
-      • box-urile dinamice folosesc box-ul DETECTAT la fiecare keyframe, nu
-        union-ul clusterului — union-ul creștea în lanț (IoU cu el însuși) până
-        acoperea jumătate de frame și se ștanța pe toate cadrele din interval.
+      • clusterele cu text care SE MIȘCĂ (tricouri/obiecte filmate) se ARUNCĂ —
+        nu-s overlay ars, iar inpainting-ul lor tocă subiectul video;
+      • union-ul unui cluster se ștanțează pe TOT clipul (static) doar dacă box-ul
+        chiar stă pe loc; altfel clusterul merge pe box-urile detectate la fiecare
+        keyframe — union-ul creștea în lanț (IoU cu el însuși) până acoperea
+        jumătate de frame.
+
+    „În mișcare" = se deplasează între keyframe-uri VECINE cu același text
+    (_motion_drift) SAU apare la înălțimi diferite pe parcursul clipului
+    (_vertical_drift). NU se mai judecă după cât variază poziția ORIZONTALĂ pe tot
+    clipul: clusterul benzii de caption adună zeci de fraze de lățimi diferite,
+    iar pe liniile late EasyOCR citește des doar o bucată („but Brucedidnftdo"
+    fără „any") — centrul bucății sare cu sute de px. Cu varianta veche un cluster
+    de 36 de caption-uri reale ieșea „în mișcare" (133px > 121px, din care 119px
+    orizontal) și era aruncat ÎNTREG: toate frazele late rămâneau arse.
     """
     clusters = []  # fiecare: {"box": union (doar pt matching/static), "hits": set, "members": [(fi, box)]}
     for fi, boxes in per_frame_boxes.items():
@@ -467,22 +704,60 @@ def group_static_boxes(per_frame_boxes, min_ratio, n_frames_detected, frame_diag
             if not placed:
                 clusters.append({"box": b, "hits": {fi}, "members": [(fi, b)]})
 
+    kf_sorted = sorted(per_frame_boxes)
+    gaps = sorted(b - a for a, b in zip(kf_sorted, kf_sorted[1:]) if b > a)
+    kf_step = gaps[len(gaps) // 2] if gaps else 1
+
     static, dynamic = [], {fi: [] for fi in per_frame_boxes}
-    n_drifting = 0
+    n_moving = 0
     for c in clusters:
-        if frame_diag and len(c["members"]) >= 3:
-            drift = _anchor_drift(c["members"])
-            if drift > DRIFT_MAX_PCT * frame_diag:
-                n_drifting += 1
-                continue
-        if len(c["hits"]) >= max(2, min_ratio * n_frames_detected):
+        many = frame_diag and len(c["members"]) >= 3
+        if many and (_motion_drift(c["members"], 2 * kf_step) > DRIFT_STEP_PCT * frame_diag
+                     or _vertical_drift(c["members"]) > DRIFT_MAX_PCT * frame_diag):
+            n_moving += 1
+            continue
+        fixed = not many or _anchor_drift(c["members"]) <= DRIFT_MAX_PCT * frame_diag
+        if fixed and len(c["hits"]) >= max(2, min_ratio * n_frames_detected):
             static.append(c["box"])
         else:
             for fi, b in c["members"]:
                 dynamic[fi].append(b)
-    if n_drifting:
-        print(f"[DETECT] {n_drifting} cluster(e) în mișcare ignorate (text pe obiecte, nu overlay)", flush=True)
+    if n_moving:
+        print(f"[DETECT] {n_moving} cluster(e) în mișcare ignorate (text pe obiecte, nu overlay)", flush=True)
     return static, dynamic
+
+
+def _fill_kf_gaps(dynamic_by_kf, kf_sorted):
+    """OCR-ul ratează uneori o linie pe UN SINGUR keyframe (încrederea cade sub
+    prag exact atunci). Cadrul acela rămânea fără mască → textul apărea o clipă
+    întreg, iar ProPainter îl propaga apoi în cadrele vecine (fantome de litere).
+    Dacă aceeași linie orizontală e găsită pe keyframe-ul dinainte ȘI pe cel de
+    după, în același loc, o punem și pe cel din mijloc."""
+    add = {}
+    for i in range(1, len(kf_sorted) - 1):
+        a, k, c = kf_sorted[i - 1], kf_sorted[i], kf_sorted[i + 1]
+        have = dynamic_by_kf.get(k, [])
+        for ba in dynamic_by_kf.get(a, []):
+            if not _is_caption_line(ba):
+                continue
+            for bc in dynamic_by_kf.get(c, []):
+                if not _is_caption_line(bc) or _iou(ba, bc) < 0.5:
+                    continue
+                u = (min(ba[0], bc[0]), min(ba[1], bc[1]), max(ba[2], bc[2]), max(ba[3], bc[3]))
+                # linia chiar lipsește? (dacă acolo e ALT text — caption cuvânt-cu-cuvânt —
+                # nu e ratare, iar box-ul lui se desenează oricum)
+                present = any(
+                    _box_area((max(u[0], b[0]), max(u[1], b[1]), min(u[2], b[2]), min(u[3], b[3])))
+                    >= 0.3 * min(_box_area(b), _box_area(u))
+                    for b in have)
+                if not present:
+                    core = (min(ba.core[0], bc.core[0]), min(ba.core[1], bc.core[1]),
+                            max(ba.core[2], bc.core[2]), max(ba.core[3], bc.core[3]))
+                    add.setdefault(k, []).append(_textbox(u, core=core, horiz=True))
+                break
+    for k, bs in add.items():
+        dynamic_by_kf.setdefault(k, []).extend(bs)
+    return sum(len(bs) for bs in add.values())
 
 
 def run_detection(video_path, w, h, fps, n_frames, targets, extra_prompts):
@@ -501,7 +776,7 @@ def run_detection(video_path, w, h, fps, n_frames, targets, extra_prompts):
         florence_prompts += ["watermark", "semi-transparent watermark"]
     florence_prompts += list(extra_prompts or [])
 
-    ocr_hits, flo_hits = {}, {}
+    ocr_raw, flo_hits = {}, {}
     kf_indices = []
     # Citire SECVENȚIALĂ, sărind cadrele nedorite cu grab() (decodare sărită).
     # Înainte era `cap.set(CAP_PROP_POS_FRAMES, idx)` per keyframe: fiecare seek
@@ -521,7 +796,7 @@ def run_detection(video_path, w, h, fps, n_frames, targets, extra_prompts):
             break
         kf_indices.append(idx)
         if want_text:
-            ocr_hits[idx] = detect_text_ocr(frame, w, h)
+            ocr_raw[idx] = detect_text_ocr(frame, w, h)
         if want_logos and florence_prompts and idx % step_florence < step_ocr:
             flo_hits[idx] = detect_florence(frame, w, h, florence_prompts)
         next_kf = idx + step_ocr
@@ -537,12 +812,16 @@ def run_detection(video_path, w, h, fps, n_frames, targets, extra_prompts):
     frame_diag = (w * w + h * h) ** 0.5
     static_boxes, dynamic_by_kf = [], {fi: [] for fi in kf_indices}
 
-    if ocr_hits:
+    if ocr_raw:
+        ocr_hits = _text_boxes_from_hits(ocr_raw, w, h)
         ocr_static, ocr_dyn = group_static_boxes(ocr_hits, STATIC_RATIO, len(ocr_hits), frame_diag)
         # dacă userul NU vrea captions, păstrăm din OCR doar textul STATIC (watermark text)
         if "captions" in targets:
             for fi, bs in ocr_dyn.items():
                 dynamic_by_kf.setdefault(fi, []).extend(bs)
+            n_fill = _fill_kf_gaps(dynamic_by_kf, sorted(kf_indices))
+            if n_fill:
+                print(f"[DETECT] {n_fill} linii ratate pe câte un keyframe, completate din vecini", flush=True)
         static_boxes += ocr_static
 
     if flo_hits:
@@ -567,58 +846,64 @@ def run_detection(video_path, w, h, fps, n_frames, targets, extra_prompts):
 # ═════════════════════════════════════════════════════════════════════════════
 # MĂȘTI TEMPORALE
 # ═════════════════════════════════════════════════════════════════════════════
-# ── Plafonul de acoperire: strânge, nu arunca ────────────────────────────────
-# Vechiul comportament scotea din mască BOX-URILE CELE MAI MARI până cobora sub
-# plafon. Adică exact caption-ul cel mai vizibil rămânea întreg pe ecran — de
-# acolo venea „uneori nu acoperă toate cuvintele" (în loguri: zeci de cadre pe job).
-# Acum strângem TOATE casetele spre centru, treptat. Primii pași mănâncă doar
-# BOX_PAD-ul (context adăugat în jurul textului, nu text), deci în cazul obișnuit
-# — unde masca depășește plafonul cu puțin — textul rămâne acoperit complet.
-# Aruncatul rămâne doar ca ultimă soluție, când nici strâns la MASK_SHRINK_FLOOR
-# nu încape.
-MASK_SHRINK_FLOOR = float(os.environ.get("MASK_SHRINK_FLOOR", "0.55"))
-_SHRINK_STEPS = (0.92, 0.84, 0.76, 0.68, 0.60)
+# ── Plafonul de acoperire: caption-urile nu se ating ─────────────────────────
+# Versiunile vechi, peste plafon, fie scoteau box-urile cele mai mari, fie le
+# strângeau pe TOATE spre centru cu aceeași fracție. În ambele cazuri plătea
+# caption-ul lat: e cel mai mare box, deci fie dispărea întreg, fie își pierdea
+# capetele („to se……ack.", „momentu……hen swing,"). Iar plafonul îl umpleau
+# altele — watermark-ul diagonal care se plimbă, box-urile statice de la Florence.
+# Acum se sacrifică în ordinea răului făcut:
+#   1) paddingul a tot ce NU e linie de caption (până la conturul textului)
+#   2) box-urile care nu-s linii de caption, cele mai mari întâi
+#   3) jumătate din paddingul caption-urilor
+# Glifele unui caption nu se taie niciodată: un caption lăsat ars pe ecran e
+# exact defectul pe care îl reparăm, deci dacă doar ele depășesc plafonul,
+# rămân întregi (se loghează).
 
-
-def _shrink_box(b, frac):
-    """Strânge caseta spre centrul ei, la `frac` din fiecare latură."""
-    x1, y1, x2, y2 = b
-    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    hw, hh = (x2 - x1) * frac / 2.0, (y2 - y1) * frac / 2.0
-    nx1, ny1 = int(round(cx - hw)), int(round(cy - hh))
-    nx2, ny2 = int(round(cx + hw)), int(round(cy + hh))
-    return (max(0, nx1), max(0, ny1), max(nx1 + 1, nx2), max(ny1 + 1, ny2))
+def _toward_core(b, t):
+    """Mută box-ul spre conturul textului (fără padding) cu fracția t ∈ [0, 1]."""
+    core = getattr(b, "core", None)
+    if core is None or t <= 0:
+        return b
+    if b.poly is not None:
+        poly = b.poly + (np.asarray(core, dtype=np.float32) - b.poly) * t
+        rect = (max(b[0], math.floor(poly[:, 0].min())), max(b[1], math.floor(poly[:, 1].min())),
+                min(b[2], math.ceil(poly[:, 0].max())), min(b[3], math.ceil(poly[:, 1].max())))
+        return _textbox(rect, poly=poly, core=core, horiz=b.horiz)
+    rect = tuple(int(round(b[i] + (core[i] - b[i]) * t)) for i in range(4))
+    return _textbox(rect, core=core, horiz=b.horiz)
 
 
 def _fit_coverage(boxes, base_static, cap):
-    """Aduce masca sub plafon. Întoarce (casete, mască, cât s-a strâns).
-
-    Aria scade cu pătratul fracției (0.84 → 71% din arie), deci de obicei ajung
-    unul-doi pași ca să coborâm sub plafon fără să pierdem litere."""
+    """Aduce masca sub plafon fără să taie din caption-uri.
+    Întoarce (casete, mască, ce s-a făcut: "ok"/"padding"/"dropped"/"over")."""
     def cover(bs):
         m = base_static.copy()
-        for (x1, y1, x2, y2) in bs:
-            m[y1:y2, x1:x2] = 255
+        for b in bs:
+            _draw_box(m, b)
         return m.mean() / 255.0, m
 
-    # 1.0 = casetele întregi: dacă apelantul ne cheamă și când masca deja încape,
-    # nu strângem degeaba
-    steps = [1.0] + [f for f in _SHRINK_STEPS if f >= MASK_SHRINK_FLOOR] + [MASK_SHRINK_FLOOR]
-    for frac in steps:
-        shrunk = [_shrink_box(b, frac) for b in boxes]
-        c, m = cover(shrunk)
+    c, m = cover(boxes)
+    if c <= cap:
+        return boxes, m, "ok"
+    lines = [b for b in boxes if _is_caption_line(b)]
+    rest = [_toward_core(b, 1.0) for b in boxes if not _is_caption_line(b)]
+    c, m = cover(lines + rest)
+    if c <= cap:
+        return lines + rest, m, "padding"
+    rest.sort(key=_box_area, reverse=True)
+    dropped = False
+    while rest:
+        rest.pop(0)
+        dropped = True
+        c, m = cover(lines + rest)
         if c <= cap:
-            return shrunk, m, frac
-    # nici strânse la maxim nu încap → abia acum scoatem cele mai mari
-    bs = sorted([_shrink_box(b, MASK_SHRINK_FLOOR) for b in boxes],
-                key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
-    while bs:
-        c, m = cover(bs)
-        if c <= cap:
-            return bs, m, MASK_SHRINK_FLOOR
-        bs.pop()
-    _, m = cover(bs)
-    return bs, m, MASK_SHRINK_FLOOR
+            return lines + rest, m, "dropped"
+    lines = [_toward_core(b, 0.5) for b in lines]
+    c, m = cover(lines)
+    if c <= cap:
+        return lines, m, "dropped" if dropped else "padding"
+    return lines, m, "over"
 
 
 
@@ -633,7 +918,8 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
     kf_sorted = sorted(kf_indices)
 
     def boxes_for_frame(fidx):
-        boxes = list(static_boxes)
+        # doar cele dinamice: staticele sunt deja în base_static (și în fb, mai jos)
+        boxes = []
         prev_kf = next_kf = None
         for k in kf_sorted:
             if k <= fidx:
@@ -646,8 +932,8 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
         return boxes
 
     base_static = np.zeros((h, w), dtype=np.uint8)
-    for (x1, y1, x2, y2) in static_boxes:
-        base_static[y1:y2, x1:x2] = 255
+    for b in static_boxes:
+        _draw_box(base_static, b)
 
     # Cadrele merg direct în stdin-ul lui ffmpeg ca raw gray. Înainte se scria
     # câte un PNG full-res per cadru pe disc (2341 fișiere la un clip de 78s,
@@ -663,9 +949,7 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
         mask_path,
     ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    n_capped = 0
-    n_dropped = 0          # cadre unde nici strânse la maxim n-au încăput
-    n_shrunk_min = 1.0     # cea mai agresivă strângere aplicată
+    cap_stats = {"padding": 0, "dropped": 0, "over": 0}
     # bbox-ul măștii PE FIECARE CADRU. Uniunea pe tot clipul aproape mereu iese
     # cât tot cadrul (text sus într-o scenă, jos în alta) și decupajul nu se mai
     # activa. Per bucată temporală banda e mult mai strânsă — vezi run_inpainting.
@@ -678,18 +962,15 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
         for fidx in range(n_frames):
             boxes = boxes_for_frame(fidx)
             mask = base_static.copy()
-            for (x1, y1, x2, y2) in boxes:
-                mask[y1:y2, x1:x2] = 255
+            for b in boxes:
+                _draw_box(mask, b)
             # plasă de siguranță: dacă masca ar acoperi >MASK_MAX_COVERAGE din frame,
-            # inpainting-ul nu mai are din ce reconstrui. STRÂNGEM casetele spre
-            # centru în loc să le aruncăm — vezi _fit_coverage.
+            # inpainting-ul nu mai are din ce reconstrui. Se sacrifică întâi ce NU
+            # e caption — vezi _fit_coverage.
             if mask.mean() / 255.0 > MASK_MAX_COVERAGE:
-                n_capped += 1
-                boxes, mask, frac = _fit_coverage(boxes, base_static, MASK_MAX_COVERAGE)
-                if frac < 1.0:
-                    n_shrunk_min = min(n_shrunk_min, frac)
-                if not boxes:
-                    n_dropped += 1
+                boxes, mask, how = _fit_coverage(boxes, base_static, MASK_MAX_COVERAGE)
+                if how in cap_stats:
+                    cap_stats[how] += 1
             fb = None
             if mask.any():
                 total_active += 1
@@ -710,11 +991,10 @@ def build_mask_video(mask_path, w, h, fps, n_frames, static_boxes, dynamic_by_kf
     if proc.returncode != 0:
         raise RuntimeError(f"Encodarea măștii a eșuat: {err[-300:]}")
 
-    if n_capped:
-        det = f"strânse până la {n_shrunk_min:.0%} din latură" if n_shrunk_min < 1.0 else "strânse"
-        if n_dropped:
-            det += f"; {n_dropped} au rămas fără casete (nici strânse nu încăpeau)"
-        print(f"[MASK] {n_capped} frame-uri plafonate la {MASK_MAX_COVERAGE:.0%} ({det})", flush=True)
+    if any(cap_stats.values()):
+        print(f"[MASK] peste plafonul de {MASK_MAX_COVERAGE:.0%}: {cap_stats['padding']} cadre doar fără padding, "
+              f"{cap_stats['dropped']} fără box-uri non-caption, {cap_stats['over']} lăsate peste plafon "
+              f"(doar caption-uri — nu se taie)", flush=True)
     print(f"[MASK] {n_frames} frames, {total_active} cu mască activă → {mask_path}", flush=True)
     roi = (ux1, uy1, ux2, uy2) if ux2 > ux1 and uy2 > uy1 else None
     return total_active, roi, frame_boxes

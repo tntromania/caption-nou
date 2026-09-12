@@ -57,7 +57,16 @@ serverul AUTO Eraser).
 
 **Detecție:** `MAX_SECONDS` (90) · `DETECT_INTERVAL` (0.5) · `FLORENCE_INTERVAL` (2.0) ·
 `OCR_CONF` (0.25) · `STATIC_RATIO` (0.60) · `MAX_BOX_AREA_PCT` (0.25) ·
-`BOX_PAD` (6) · `DRIFT_MAX_PCT` (0.04) · `MASK_MAX_COVERAGE` (0.25)
+`BOX_PAD` (6) · `MASK_MAX_COVERAGE` (0.25 — peste plafon se sacrifică întâi
+ce nu e caption; glifele caption-urilor nu se taie niciodată)
+
+**Text pe obiecte vs caption ars:** `DRIFT_STEP_PCT` (0.012 — cât se poate mișca
+același text între keyframe-uri vecine) · `DRIFT_MAX_PCT` (0.04 — variația pe
+verticală pe tot clipul; și pragul ca un cluster să fie ștanțat static) ·
+`DRIFT_TRIM` (0.10) · `SAME_TEXT_TOL` (0.12)
+
+**Bucăți OCR citite nesigur (păstrate dacă stau pe linie cu text sigur):**
+`HORIZ_DEG` (10) · `LINE_GAP` (1.2) · `LINE_H_RATIO` (2.2) · `WEAK_TEMPORAL_KF` (2)
 
 **Calitate inpainting:** `PROC_MAX_SIDE` (832) · `MIN_PROC_SIDE` (320) ·
 `MASK_DILATE_PX` (6) · `PXFRAMES_PER_GB` (5.0e6) · `CHUNK_OVERLAP` (12) ·
