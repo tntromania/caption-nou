@@ -1407,8 +1407,49 @@ def probe(video_path):
     return w, h, fps, n, n / fps
 
 
+# Proxy-ul din fața captions.viralio.ro taie orice request al cărui body
+# durează peste 100s. De pe unele hosturi RunPod uploadul merge ~0.5 MB/s, deci
+# un rezultat de 50MB+ trimis dintr-o bucată pica. Pe bucăți de 8MB fiecare
+# request durează secunde, iar o bucată picată se retrimite (serverul le scrie
+# separat, deci retrimiterea e sigură). Același protocol ca în caption-eraser-ai.
+CHUNK_BYTES = 8 * 1024 * 1024
+CHUNK_TRIES = 4
+
+
+def upload_chunked(url, path, job_id):
+    size = os.path.getsize(path)
+    total = max(1, -(-size // CHUNK_BYTES))
+    t0 = time.time()
+    with open(path, "rb") as f:
+        for i in range(total):
+            data = f.read(CHUNK_BYTES)
+            for attempt in range(1, CHUNK_TRIES + 1):
+                try:
+                    r = requests.post(
+                        url,
+                        files={"chunk": ("part", data, "application/octet-stream")},
+                        data={"job_id": job_id, "index": i, "total": total},
+                        timeout=90,
+                    )
+                    if r.ok:
+                        break
+                    err = f"HTTP {r.status_code}"
+                except requests.RequestException as e:
+                    err = str(e)
+                print(f"[UPLOAD] bucata {i+1}/{total}, încercarea {attempt}: {err}", flush=True)
+                if attempt == CHUNK_TRIES:
+                    raise RuntimeError(f"upload eșuat la bucata {i+1}/{total}: {err}")
+                time.sleep(2 * attempt)
+    dt = time.time() - t0
+    print(f"[UPLOAD] OK — {total} bucăți în {dt:.1f}s ({size/1024/1024/max(dt, 0.001):.2f} MB/s)", flush=True)
+
+
 def deliver(out_path, job_input):
     size_mb = round(os.path.getsize(out_path) / 1024 / 1024, 2)
+    chunk_url = job_input.get("callback_chunk_url")
+    if chunk_url and job_input.get("job_id"):
+        upload_chunked(chunk_url, out_path, str(job_input["job_id"]))
+        return {"result_uploaded": True, "size_mb": size_mb}
     cb = job_input.get("callback_url")
     if cb and job_input.get("job_id"):
         with open(out_path, "rb") as f:
